@@ -1,6 +1,13 @@
+"""
+app.py — FastAPI application with:
+  - JWT authentication
+  - Rate limiting (slowapi)
+  - Input validation (Pydantic schemas)
+  - Input sanitization (sanitize.py)
+"""
+
 from fastapi import FastAPI, WebSocket, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -20,15 +27,18 @@ from src.auth import (
 )
 from src.database import init_db, insert_data
 from src.limiter import limiter
+from src.schemas import SensorReading, PredictionResponse, LoginRequest
+from src.sanitize import sanitize_mode, sanitize_sensor_dict
 
 mode = "normal"
 damage_level = 0
 
-app = FastAPI(title="Edge AI Predictive Maintenance API")
+app = FastAPI(
+    title="Edge AI Predictive Maintenance API",
+    description="Real-time machine health monitoring with RUL prediction.",
+    version="1.0.0",
+)
 
-# ── Register limiter + its error handler ──────────────────────
-# Without this, hitting a limit raises an unhandled exception
-# instead of returning a clean 429 response.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -54,23 +64,32 @@ output_details = interpreter.get_output_details()
 
 scaler = joblib.load(SCALER_PATH)
 
-# ── WebSocket connection tracker (simple in-memory) ───────────
-# Prevents a single IP from opening unlimited WebSocket connections.
-# In production, use Redis for this so it works across multiple workers.
 ws_connections: dict[str, int] = defaultdict(int)
 WS_MAX_PER_IP = 3
 
-# ── Auth routes ───────────────────────────────────────────────
+
+# ── Auth ──────────────────────────────────────────────────────
 
 @app.post("/auth/login", response_model=Token, tags=["Auth"])
-@limiter.limit("10/minute")           # Brute-force protection
+@limiter.limit("10/minute")
 def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     """
-    Login with username + password.
-    Rate limit: 10 attempts per minute per IP.
-    Returns a JWT access token valid for 60 minutes.
+    Authenticate and receive a JWT token.
+
+    Validation applied:
+    - username/password fields must be non-empty strings (OAuth2 form enforces this)
+    - Wrong credentials → 401 (never reveals which field is wrong)
     """
-    user = authenticate_user(form_data.username, form_data.password)
+    # OAuth2PasswordRequestForm already validates username/password are present.
+    # We do one extra pass: strip whitespace from username before lookup.
+    username = form_data.username.strip().lower()
+    password = form_data.password
+
+    # Block suspiciously long inputs before they hit hashing (bcrypt is slow)
+    if len(username) > 64 or len(password) > 128:
+        raise HTTPException(status_code=400, detail="Input exceeds maximum length")
+
+    user = authenticate_user(username, password)
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
@@ -84,7 +103,6 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
 @app.get("/auth/me", response_model=User, tags=["Auth"])
 @limiter.limit("60/minute")
 def get_me(request: Request, current_user: User = Depends(get_current_user)):
-    """Returns info about the currently logged-in user."""
     return current_user
 
 
@@ -96,26 +114,90 @@ def home(request: Request):
     return {"message": "Edge AI Predictive Maintenance API 🚀"}
 
 
+# ── Predict (single reading via REST) ─────────────────────────
+
+@app.post("/predict", response_model=PredictionResponse, tags=["Inference"])
+@limiter.limit("60/minute")
+def predict(
+    request: Request,
+    reading: SensorReading,                         # ← Pydantic validates this
+    current_user: User = Depends(get_current_user), # ← JWT required
+):
+    """
+    Run RUL prediction on a single validated sensor reading.
+
+    Pydantic enforces:
+    - All fields present and correct type
+    - Temperature in [250, 400] K
+    - Torque in [0, 100] Nm
+    - Tool wear in [0, 300] min
+    - Rotational speed in [0, 3000] rpm
+    - process_temp > air_temp (cross-field validator)
+    - machine_id matches M1–M999 format
+    """
+    features = np.array([[
+        reading.air_temperature,
+        reading.temperature,
+        reading.rotational_speed,
+        reading.torque,
+        reading.tool_wear,
+    ]], dtype=np.float32)
+
+    # Normalise using the fitted scaler
+    features_scaled = scaler.transform(features)
+
+    # Reshape to (1, 30, 5) — repeat single row to fill window
+    sample = np.tile(features_scaled, (1, 30, 1)).reshape(1, 30, 5).astype(np.float32)
+
+    interpreter.set_tensor(input_details[0]['index'], sample)
+    interpreter.invoke()
+    prediction = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+    prediction = max(0.0, prediction)
+
+    if prediction < 60:
+        status = "CRITICAL"
+    elif prediction < 120:
+        status = "WARNING"
+    else:
+        status = "HEALTHY"
+
+    # Sanitize before DB insert
+    record = sanitize_sensor_dict({
+        "machine_id":      reading.machine_id,
+        "step":            0,
+        "RUL":             prediction,
+        "status":          status,
+        "temperature":     reading.temperature,
+        "air_temperature": reading.air_temperature,
+        "torque":          reading.torque,
+        "tool_wear":       reading.tool_wear,
+        "speed":           reading.rotational_speed,
+    })
+    insert_data(record)
+
+    return {**record, "RUL": prediction, "status": status}
+
+
 # ── Mode control ──────────────────────────────────────────────
 
 @app.post("/set_mode/{new_mode}", tags=["Control"])
-@limiter.limit("30/minute")           # Prevent rapid mode-spamming
+@limiter.limit("30/minute")
 def set_mode(
     new_mode: str,
     request: Request,
     current_user: User = Depends(require_admin),
 ):
     """
-    Set simulation mode: normal | degrade | failure
-    Rate limit: 30 per minute. Requires: admin role.
+    Set simulation mode: normal | degrade | failure.
+    Sanitized via sanitize_mode() — rejects anything outside the allowed set.
     """
     global mode, damage_level
 
-    allowed = {"normal", "degrade", "failure"}
-    if new_mode not in allowed:
-        raise HTTPException(status_code=400, detail=f"Mode must be one of {allowed}")
+    try:
+        mode = sanitize_mode(new_mode)   # raises ValueError on bad input
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    mode = new_mode
     if mode == "normal":
         damage_level = 0
     elif mode == "failure":
@@ -130,29 +212,24 @@ def set_mode(
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Real-time sensor stream.
-    Connect with: ws://host/ws?token=<jwt>
-
-    Per-IP connection limit: max 3 simultaneous WebSocket connections.
+    Real-time sensor stream. Connect with: ws://host/ws?token=<jwt>
+    All outgoing data is sanitized via sanitize_sensor_dict() before
+    being inserted into the database.
     """
     global damage_level, mode
 
-    # ── Auth ──
     user = await get_ws_user(websocket)
     if not user:
         return
 
-    # ── Per-IP connection limit ──
     client_ip = websocket.client.host
     if ws_connections[client_ip] >= WS_MAX_PER_IP:
         await websocket.close(code=1008)
-        print(f"[WS] Rejected {client_ip} — too many connections ({WS_MAX_PER_IP} max)")
+        print(f"[WS] Rejected {client_ip} — connection limit reached")
         return
 
     await websocket.accept()
     ws_connections[client_ip] += 1
-    print(f"[WS] Connected — user: {user.username} | IP: {client_ip} | "
-          f"total from IP: {ws_connections[client_ip]}")
 
     X = np.load(DATA_PATH)
     i = 200
@@ -173,10 +250,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             interpreter.set_tensor(input_details[0]['index'], sample)
             interpreter.invoke()
-            prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
-
-            prediction -= damage_level * 0.5
-            prediction = max(prediction, 0)
+            prediction = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+            prediction = max(0.0, prediction - damage_level * 0.5)
 
             if prediction < 60:
                 status = "CRITICAL"
@@ -195,25 +270,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 speed  = float(original_values[4])
             except Exception as e:
                 print(f"[SCALER ERROR] {e}")
-                temp, air, torque, wear, speed = 0, 0, 0, 0, 0
+                temp, air, torque, wear, speed = 300.0, 298.0, 40.0, 0.0, 1500.0
 
-            data = {
+            # Sanitize before DB insert — clamps any model-generated outliers
+            record = sanitize_sensor_dict({
                 "machine_id":      "M1",
                 "step":            i,
-                "RUL":             float(prediction),
+                "RUL":             prediction,
                 "status":          status,
                 "temperature":     temp,
                 "air_temperature": air,
                 "torque":          torque,
                 "tool_wear":       wear,
                 "speed":           speed,
-            }
+            })
 
-            insert_data(data)
-            await websocket.send_json(data)
-
-            print(f"[WS] MODE={mode} DAMAGE={damage_level:.1f} "
-                  f"RUL={prediction:.2f} STATUS={status}")
+            insert_data(record)
+            await websocket.send_json({**record, "RUL": prediction})
 
             i += 1
             if i >= len(X):
@@ -225,6 +298,5 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"[WS ERROR] {e}")
 
     finally:
-        # Always decrement counter, even on crash
         ws_connections[client_ip] = max(0, ws_connections[client_ip] - 1)
-        print(f"[WS] Disconnected — user: {user.username} | IP: {client_ip}")
+        print(f"[WS] Disconnected — user: {user.username}")
