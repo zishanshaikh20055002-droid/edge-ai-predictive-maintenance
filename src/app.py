@@ -1,14 +1,16 @@
 """
 app.py — FastAPI application with:
   - JWT authentication
-  - Rate limiting (slowapi)
-  - Input validation (Pydantic schemas)
-  - Input sanitization (sanitize.py)
+  - Rate limiting
+  - Input validation + sanitization
+  - Prometheus metrics exposed at /metrics
 """
 
+import time
 from fastapi import FastAPI, WebSocket, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from prometheus_fastapi_instrumentator import Instrumentator
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 import numpy as np
@@ -27,8 +29,14 @@ from src.auth import (
 )
 from src.database import init_db, insert_data
 from src.limiter import limiter
-from src.schemas import SensorReading, PredictionResponse, LoginRequest
+from src.schemas import SensorReading, PredictionResponse
 from src.sanitize import sanitize_mode, sanitize_sensor_dict
+from src.metrics import (
+    rul_gauge, health_status_counter, inference_latency,
+    ws_active_connections, ws_messages_sent,
+    simulation_mode_info, damage_level_gauge,
+    sensor_temperature, sensor_torque, sensor_tool_wear, sensor_speed,
+)
 
 mode = "normal"
 damage_level = 0
@@ -38,6 +46,11 @@ app = FastAPI(
     description="Real-time machine health monitoring with RUL prediction.",
     version="1.0.0",
 )
+
+# ── Prometheus: auto-instrument all HTTP endpoints ────────────
+# Exposes /metrics with: request count, latency histograms,
+# response sizes, status code breakdowns — all for free.
+Instrumentator().instrument(app).expose(app)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -52,7 +65,7 @@ app.add_middleware(
 
 init_db()
 
-BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH  = os.path.join(BASE_DIR, "models", "model_int8.tflite")
 SCALER_PATH = os.path.join(BASE_DIR, "data",   "scaler.pkl")
 DATA_PATH   = os.path.join(BASE_DIR, "data",   "X.npy")
@@ -73,19 +86,9 @@ WS_MAX_PER_IP = 3
 @app.post("/auth/login", response_model=Token, tags=["Auth"])
 @limiter.limit("10/minute")
 def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    Authenticate and receive a JWT token.
-
-    Validation applied:
-    - username/password fields must be non-empty strings (OAuth2 form enforces this)
-    - Wrong credentials → 401 (never reveals which field is wrong)
-    """
-    # OAuth2PasswordRequestForm already validates username/password are present.
-    # We do one extra pass: strip whitespace from username before lookup.
     username = form_data.username.strip().lower()
     password = form_data.password
 
-    # Block suspiciously long inputs before they hit hashing (bcrypt is slow)
     if len(username) > 64 or len(password) > 128:
         raise HTTPException(status_code=400, detail="Input exceeds maximum length")
 
@@ -114,27 +117,23 @@ def home(request: Request):
     return {"message": "Edge AI Predictive Maintenance API 🚀"}
 
 
-# ── Predict (single reading via REST) ─────────────────────────
+@app.get("/health", tags=["General"])
+def health():
+    """Health check endpoint — used by Docker and load balancers."""
+    return {"status": "ok"}
+
+
+# ── Predict ───────────────────────────────────────────────────
 
 @app.post("/predict", response_model=PredictionResponse, tags=["Inference"])
 @limiter.limit("60/minute")
 def predict(
     request: Request,
-    reading: SensorReading,                         # ← Pydantic validates this
-    current_user: User = Depends(get_current_user), # ← JWT required
+    reading: SensorReading,
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Run RUL prediction on a single validated sensor reading.
+    machine_id = reading.machine_id
 
-    Pydantic enforces:
-    - All fields present and correct type
-    - Temperature in [250, 400] K
-    - Torque in [0, 100] Nm
-    - Tool wear in [0, 300] min
-    - Rotational speed in [0, 3000] rpm
-    - process_temp > air_temp (cross-field validator)
-    - machine_id matches M1–M999 format
-    """
     features = np.array([[
         reading.air_temperature,
         reading.temperature,
@@ -143,15 +142,16 @@ def predict(
         reading.tool_wear,
     ]], dtype=np.float32)
 
-    # Normalise using the fitted scaler
     features_scaled = scaler.transform(features)
-
-    # Reshape to (1, 30, 5) — repeat single row to fill window
     sample = np.tile(features_scaled, (1, 30, 1)).reshape(1, 30, 5).astype(np.float32)
 
+    # ── Time the inference and record it ──
+    t_start = time.time()
     interpreter.set_tensor(input_details[0]['index'], sample)
     interpreter.invoke()
     prediction = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+    inference_latency.labels(machine_id=machine_id).observe(time.time() - t_start)
+
     prediction = max(0.0, prediction)
 
     if prediction < 60:
@@ -161,9 +161,16 @@ def predict(
     else:
         status = "HEALTHY"
 
-    # Sanitize before DB insert
+    # ── Update metrics ──
+    rul_gauge.labels(machine_id=machine_id).set(prediction)
+    health_status_counter.labels(machine_id=machine_id, status=status).inc()
+    sensor_temperature.labels(machine_id=machine_id).set(reading.temperature)
+    sensor_torque.labels(machine_id=machine_id).set(reading.torque)
+    sensor_tool_wear.labels(machine_id=machine_id).set(reading.tool_wear)
+    sensor_speed.labels(machine_id=machine_id).set(reading.rotational_speed)
+
     record = sanitize_sensor_dict({
-        "machine_id":      reading.machine_id,
+        "machine_id":      machine_id,
         "step":            0,
         "RUL":             prediction,
         "status":          status,
@@ -187,14 +194,10 @@ def set_mode(
     request: Request,
     current_user: User = Depends(require_admin),
 ):
-    """
-    Set simulation mode: normal | degrade | failure.
-    Sanitized via sanitize_mode() — rejects anything outside the allowed set.
-    """
     global mode, damage_level
 
     try:
-        mode = sanitize_mode(new_mode)   # raises ValueError on bad input
+        mode = sanitize_mode(new_mode)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -202,6 +205,10 @@ def set_mode(
         damage_level = 0
     elif mode == "failure":
         damage_level = 30
+
+    # ── Update mode metric ──
+    simulation_mode_info.info({"mode": mode})
+    damage_level_gauge.set(damage_level)
 
     print(f"[MODE] '{mode}' set by '{current_user.username}'")
     return {"mode": mode, "set_by": current_user.username}
@@ -211,11 +218,6 @@ def set_mode(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Real-time sensor stream. Connect with: ws://host/ws?token=<jwt>
-    All outgoing data is sanitized via sanitize_sensor_dict() before
-    being inserted into the database.
-    """
     global damage_level, mode
 
     user = await get_ws_user(websocket)
@@ -225,12 +227,13 @@ async def websocket_endpoint(websocket: WebSocket):
     client_ip = websocket.client.host
     if ws_connections[client_ip] >= WS_MAX_PER_IP:
         await websocket.close(code=1008)
-        print(f"[WS] Rejected {client_ip} — connection limit reached")
         return
 
     await websocket.accept()
     ws_connections[client_ip] += 1
+    ws_active_connections.inc()   # ← metric
 
+    machine_id = "M1"
     X = np.load(DATA_PATH)
     i = 200
 
@@ -248,9 +251,13 @@ async def websocket_endpoint(websocket: WebSocket):
             sample[:, :, 3] += damage_level * 0.3
             sample[:, :, 0] += damage_level * 0.2
 
+            # ── Timed inference ──
+            t_start = time.time()
             interpreter.set_tensor(input_details[0]['index'], sample)
             interpreter.invoke()
             prediction = float(interpreter.get_tensor(output_details[0]['index'])[0][0])
+            inference_latency.labels(machine_id=machine_id).observe(time.time() - t_start)
+
             prediction = max(0.0, prediction - damage_level * 0.5)
 
             if prediction < 60:
@@ -272,9 +279,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"[SCALER ERROR] {e}")
                 temp, air, torque, wear, speed = 300.0, 298.0, 40.0, 0.0, 1500.0
 
-            # Sanitize before DB insert — clamps any model-generated outliers
+            # ── Update all metrics ──
+            rul_gauge.labels(machine_id=machine_id).set(prediction)
+            health_status_counter.labels(machine_id=machine_id, status=status).inc()
+            damage_level_gauge.set(damage_level)
+            simulation_mode_info.info({"mode": mode})
+            sensor_temperature.labels(machine_id=machine_id).set(temp)
+            sensor_torque.labels(machine_id=machine_id).set(torque)
+            sensor_tool_wear.labels(machine_id=machine_id).set(wear)
+            sensor_speed.labels(machine_id=machine_id).set(speed)
+            ws_messages_sent.labels(machine_id=machine_id).inc()
+
             record = sanitize_sensor_dict({
-                "machine_id":      "M1",
+                "machine_id":      machine_id,
                 "step":            i,
                 "RUL":             prediction,
                 "status":          status,
@@ -299,4 +316,5 @@ async def websocket_endpoint(websocket: WebSocket):
 
     finally:
         ws_connections[client_ip] = max(0, ws_connections[client_ip] - 1)
+        ws_active_connections.dec()   # ← metric
         print(f"[WS] Disconnected — user: {user.username}")

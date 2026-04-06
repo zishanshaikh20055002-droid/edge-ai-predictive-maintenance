@@ -1,0 +1,167 @@
+{
+  "title": "Edge AI Predictive Maintenance",
+  "uid": "edge-ai-pm",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Remaining Useful Life — M1",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 300,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": 0   },
+              { "color": "orange", "value": 60  },
+              { "color": "green",  "value": 120 }
+            ]
+          },
+          "unit": "short",
+          "displayName": "RUL"
+        }
+      },
+      "targets": [{
+        "expr": "machine_rul{machine_id=\"M1\"}",
+        "legendFormat": "RUL"
+      }]
+    },
+
+    {
+      "id": 2,
+      "title": "RUL Over Time",
+      "type": "timeseries",
+      "gridPos": { "x": 6, "y": 0, "w": 18, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": 0   },
+              { "color": "orange", "value": 60  },
+              { "color": "green",  "value": 120 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "expr": "machine_rul{machine_id=\"M1\"}",
+        "legendFormat": "RUL — M1"
+      }]
+    },
+
+    {
+      "id": 3,
+      "title": "Health Status Counts",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 4 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" },
+      "targets": [
+        { "expr": "machine_health_status_total{machine_id=\"M1\", status=\"HEALTHY\"}", "legendFormat": "HEALTHY" },
+        { "expr": "machine_health_status_total{machine_id=\"M1\", status=\"WARNING\"}", "legendFormat": "WARNING" },
+        { "expr": "machine_health_status_total{machine_id=\"M1\", status=\"CRITICAL\"}", "legendFormat": "CRITICAL" }
+      ]
+    },
+
+    {
+      "id": 4,
+      "title": "Inference Latency (p99)",
+      "type": "stat",
+      "gridPos": { "x": 8, "y": 8, "w": 4, "h": 4 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, rate(ml_inference_latency_seconds_bucket{machine_id=\"M1\"}[1m]))",
+        "legendFormat": "p99 latency"
+      }]
+    },
+
+    {
+      "id": 5,
+      "title": "Active WebSocket Connections",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 8, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "websocket_active_connections",
+        "legendFormat": "connections"
+      }]
+    },
+
+    {
+      "id": 6,
+      "title": "Damage Level",
+      "type": "gauge",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": 0  },
+              { "color": "orange", "value": 30 },
+              { "color": "red",    "value": 70 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "expr": "simulation_damage_level",
+        "legendFormat": "damage"
+      }]
+    },
+
+    {
+      "id": 7,
+      "title": "Sensor — Process Temperature (K)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "sensor_process_temperature_kelvin{machine_id=\"M1\"}",
+        "legendFormat": "Temp (K)"
+      }]
+    },
+
+    {
+      "id": 8,
+      "title": "Sensor — Torque (Nm) & Tool Wear (min)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 6 },
+      "targets": [
+        { "expr": "sensor_torque_nm{machine_id=\"M1\"}",           "legendFormat": "Torque (Nm)" },
+        { "expr": "sensor_tool_wear_minutes{machine_id=\"M1\"}",   "legendFormat": "Tool Wear (min)" }
+      ]
+    },
+
+    {
+      "id": 9,
+      "title": "HTTP Request Rate (all endpoints)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 18, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "rate(http_requests_total[1m])",
+        "legendFormat": "{{method}} {{handler}}"
+      }]
+    },
+
+    {
+      "id": 10,
+      "title": "HTTP Error Rate (4xx + 5xx)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 18, "w": 12, "h": 6 },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "targets": [{
+        "expr": "rate(http_requests_total{status=~\"4..|5..\"}[1m])",
+        "legendFormat": "{{status}} {{handler}}"
+      }]
+    }
+
+  ]
+}

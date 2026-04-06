@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment — never copy this into the image
+venv/
+.venv/
+env/
+
+# Data and models — mounted as volumes, not baked into image
+data/
+models/
+
+# Jupyter notebooks — not needed at runtime
+notebooks/
+*.ipynb
+
+# Git
+.git/
+.gitignore
+
+# Env files — secrets must never go into a Docker image
+.env
+*.env
+
+# Grafana and Prometheus configs — not part of the app container
+grafana/
+prometheus.yml
+
+# Dashboard
+dashboard.html
+
+# Misc
+*.md
+*.log
+.DS_Store
+Thumbs.db
