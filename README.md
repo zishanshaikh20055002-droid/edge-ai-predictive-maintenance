@@ -1,4 +1,4 @@
-
+Edge AI Predictive Maintenance System
 
 1. Introduction
 
