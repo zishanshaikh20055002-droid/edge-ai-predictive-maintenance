@@ -18,7 +18,7 @@ class WSManager:
 
     async def broadcast(self, data: dict):
         dead = set()
-        for ws in self.active:
+        for ws in tuple(self.active):
             try:
                 await ws.send_json(data)
             except Exception:

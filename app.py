@@ -9,7 +9,7 @@ import joblib
 from collections import defaultdict
 from datetime import timedelta
 
-from fastapi import FastAPI, WebSocket, Depends, HTTPException, Request
+from fastapi import FastAPI, WebSocket, Depends, HTTPException, Request, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -80,7 +80,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -93,7 +93,7 @@ WS_MAX_PER_IP = 3
 # ── Startup ───────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     manager.set_loop(loop)
 
     thread = threading.Thread(
@@ -174,7 +174,8 @@ async def websocket_endpoint(websocket: WebSocket):
     if not user:
         return
 
-    client_ip = websocket.client.host
+    client = websocket.client
+    client_ip = client.host if client and client.host else "unknown"
     if ws_connections[client_ip] >= WS_MAX_PER_IP:
         await websocket.close(code=1008)
         return
@@ -186,7 +187,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            await asyncio.sleep(30)  
+            # Keep a receive loop so disconnects are detected and cleaned up.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
     except Exception:
         pass
     finally:

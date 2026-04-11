@@ -21,6 +21,8 @@ services:
       - PYTHONUNBUFFERED=1
       - MQTT_BROKER=mosquitto
       - MQTT_PORT=1883
+      - MC_PASSES=30
+      - MC_NOISE_STD=0.01
     restart: unless-stopped
     depends_on:
       - mosquitto
@@ -42,6 +44,7 @@ services:
       - MACHINE_ID=M1
       - PUBLISHER_MODE=replay
       - PUBLISH_RATE=1.0
+      - PUBLISH_START_STEP=100
     command: ["python", "-m", "src.mqtt_publisher"]
     restart: unless-stopped
     depends_on:

@@ -244,9 +244,26 @@
 </div>
 
 <script>
-const API = "http://127.0.0.1:8000";
+const API_ORIGIN = (() => {
+  const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
+  const host = window.location.hostname || '127.0.0.1';
+  return `${protocol}://${host}:8000`;
+})();
+const WS_ORIGIN = API_ORIGIN.replace(/^http/, 'ws');
+
 let token = null, userRole = null, ws = null;
 let stepCount = 0;
+
+function decodeJwtPayload(jwtToken) {
+  try {
+    const payloadPart = jwtToken.split('.')[1] || '';
+    const normalized = payloadPart.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    return JSON.parse(atob(padded));
+  } catch {
+    return {};
+  }
+}
 
 // ── Chart.js Configurations ────────────────────────────
 
@@ -300,15 +317,15 @@ async function login() {
   errEl.textContent = '';
   if (!username || !password) { errEl.textContent = 'Credentials required.'; return; }
   try {
-    const res = await fetch(`${API}/auth/login`, {
+    const res = await fetch(`${API_ORIGIN}/auth/login`, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ username, password })
     });
     if (!res.ok) { const e = await res.json(); errEl.textContent = e.detail || 'Authentication failed.'; return; }
     const data = await res.json();
     token = data.access_token;
-    const payload = JSON.parse(atob(token.split('.')[1]));
-    userRole = payload.role;
+    const payload = decodeJwtPayload(token);
+    userRole = payload.role || 'operator';
     
     document.getElementById('login-overlay').style.display = 'none';
     document.getElementById('dashboard').style.display = 'block';
@@ -331,7 +348,7 @@ function logout() {
 
 // ── WebSocket Logic ────────────────────────────────────────
 function connectWS() {
-  ws = new WebSocket(`ws://127.0.0.1:8000/ws?token=${token}`);
+  ws = new WebSocket(`${WS_ORIGIN}/ws?token=${encodeURIComponent(token)}`);
   ws.onopen = () => {
     document.getElementById('connDot').className = 'conn-dot live';
     document.getElementById('connLabel').textContent = 'STREAMING';
@@ -393,9 +410,9 @@ function connectWS() {
         document.getElementById(`bar-${id}`).style.width = `${pct}%`;
     };
     
-    updateSensor('temp', d.temperature ?? 0, 650);
+    updateSensor('temp', d.temperature ?? 0, 400);
     updateSensor('air', d.air_temperature ?? 0, 400);
-    updateSensor('torque', d.torque ?? 0, 2000);
+    updateSensor('torque', d.torque ?? 0, 100);
     updateSensor('wear', d.tool_wear ?? 0, 300);
   };
 }

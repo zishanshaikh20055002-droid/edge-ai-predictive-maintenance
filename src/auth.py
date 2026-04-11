@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
 from typing import Optional
+import os
 
 from fastapi import Depends, HTTPException, status, WebSocket
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 # ── Config ────────────────────────────────────────────────────
 # In production: load SECRET_KEY from env, never hardcode it
 # Generate a strong key with: openssl rand -hex 32
-SECRET_KEY = "your-secret-key-change-this-in-production"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 

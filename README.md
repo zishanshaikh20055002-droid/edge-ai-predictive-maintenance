@@ -419,11 +419,24 @@ venv\Scripts\activate
 
 pip install -r requirements.txt
 
-uvicorn src.app:app --reload
+uvicorn app:app --reload
 
 Frontend:
 
 python -m http.server 5500
+
+
+14.3 Runtime Tuning (Optional)
+
+MC_PASSES: Number of Monte Carlo inference passes in fallback mode.
+
+MC_NOISE_STD: Noise scale for stochastic inference in fallback mode.
+
+PUBLISH_RATE: Delay (seconds) between MQTT replay messages.
+
+PUBLISH_START_STEP: Initial replay index for CMAPSS stream.
+
+MACHINE_ID: Publisher machine/topic identifier (e.g., M1, M2).
 
 
 ---

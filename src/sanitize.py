@@ -59,10 +59,24 @@ def sanitize_sensor_dict(data: dict) -> dict:
     Use this as the last step before insert_data() to catch anything
     that slipped through validation (e.g. values injected by the model itself).
     """
+    raw_stage_probs = data.get("stage_probs", [0.0, 0.0, 0.0])
+    if not isinstance(raw_stage_probs, (list, tuple)):
+        raw_stage_probs = [0.0, 0.0, 0.0]
+
+    stage_probs = [float(clamp(p, 0.0, 1.0)) for p in list(raw_stage_probs)[:3]]
+    while len(stage_probs) < 3:
+        stage_probs.append(0.0)
+
+    total = sum(stage_probs)
+    if total > 0:
+        stage_probs = [p / total for p in stage_probs]
+
     return {
         "machine_id":      sanitize_machine_id(str(data.get("machine_id", "M1"))),
         "step":            int(clamp(data.get("step", 0), 0, 1_000_000)),
         "RUL":             clamp(data.get("RUL", 0.0), 0.0, 10_000.0),
+        "RUL_std":         clamp(data.get("RUL_std", 0.0), 0.0, 10_000.0),
+        "stage_probs":     [round(p, 3) for p in stage_probs],
         "status":          sanitize_string(str(data.get("status", "UNKNOWN")), max_length=16),
         "temperature":     clamp(data.get("temperature", 0.0),     250.0, 400.0),
         "air_temperature": clamp(data.get("air_temperature", 0.0), 250.0, 400.0),
