@@ -12,6 +12,8 @@ Heads:
 import tensorflow as tf
 from tensorflow.keras import Model, layers
 
+from src.imbalance import build_weighted_binary_focal_loss, build_weighted_focal_bce
+
 
 def _temporal_encoder(inputs, filters=64, lstm_units=64, dropout=0.2, name_prefix="enc"):
     x = layers.Conv1D(filters, kernel_size=5, padding="same", activation="relu", name=f"{name_prefix}_conv1")(inputs)
@@ -62,15 +64,26 @@ def build_multimodal_mtl_model(
 
     # Head 1: system-level RUL
     head_rul = layers.Dense(64, activation="relu", name="rul_dense")(shared)
-    head_rul = layers.Dense(1, activation="relu", name="head_rul")(head_rul)
+    # Keep output heads in float32 for numerical stability under mixed precision.
+    head_rul = layers.Dense(1, activation="relu", name="head_rul", dtype="float32")(head_rul)
 
     # Head 2: multi-label fault diagnosis
     head_faults = layers.Dense(64, activation="relu", name="fault_dense")(shared)
-    head_faults = layers.Dense(num_fault_classes, activation="sigmoid", name="head_faults")(head_faults)
+    head_faults = layers.Dense(
+        num_fault_classes,
+        activation="sigmoid",
+        name="head_faults",
+        dtype="float32",
+    )(head_faults)
 
     # Head 3: anomaly score for unknown behaviors
     head_anomaly_score = layers.Dense(32, activation="relu", name="anomaly_dense")(shared)
-    head_anomaly_score = layers.Dense(1, activation="sigmoid", name="head_anomaly_score")(head_anomaly_score)
+    head_anomaly_score = layers.Dense(
+        1,
+        activation="sigmoid",
+        name="head_anomaly_score",
+        dtype="float32",
+    )(head_anomaly_score)
 
     return Model(
         inputs=[process_input, vibration_input, acoustic_input, electrical_input, thermal_input],
@@ -85,13 +98,37 @@ def compile_multimodal_mtl_model(
     faults_weight=2.0,
     anomaly_weight=1.0,
     learning_rate=1e-3,
+    fault_class_weights=None,
+    anomaly_pos_weight=1.0,
+    use_focal_losses=True,
+    focal_gamma=2.0,
+    steps_per_execution=1,
+    jit_compile=False,
 ):
+    if fault_class_weights is None:
+        fault_class_weights = [1.0] * int(model.get_layer("head_faults").output_shape[-1])
+
+    if use_focal_losses:
+        faults_loss = build_weighted_focal_bce(
+            class_weights=fault_class_weights,
+            gamma=focal_gamma,
+            label_smoothing=0.01,
+        )
+        anomaly_loss = build_weighted_binary_focal_loss(
+            pos_weight=float(anomaly_pos_weight),
+            gamma=focal_gamma,
+            label_smoothing=0.01,
+        )
+    else:
+        faults_loss = "binary_crossentropy"
+        anomaly_loss = "binary_crossentropy"
+
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss={
             "head_rul": "mse",
-            "head_faults": "binary_crossentropy",
-            "head_anomaly_score": "binary_crossentropy",
+            "head_faults": faults_loss,
+            "head_anomaly_score": anomaly_loss,
         },
         loss_weights={
             "head_rul": rul_weight,
@@ -103,6 +140,8 @@ def compile_multimodal_mtl_model(
             "head_faults": ["accuracy", tf.keras.metrics.AUC(name="auc")],
             "head_anomaly_score": [tf.keras.metrics.AUC(name="auc")],
         },
+        steps_per_execution=steps_per_execution,
+        jit_compile=jit_compile,
     )
     return model
 

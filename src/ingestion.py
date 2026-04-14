@@ -1,8 +1,12 @@
 import numpy as np
 import logging
+import json
+import os
 from collections import defaultdict
 from collections import deque
 import time
+
+from src.sensor_contract import CANONICAL_FEATURE_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,27 @@ class AsyncSensorFusionBuffer:
                 suffix = name.split("sensor_measurement_")[-1]
                 self.alias_map[f"s{suffix}"] = name
 
+        # Built-in aliases for future real sensors (rpm, torque_nm, etc.).
+        for alias, target in CANONICAL_FEATURE_ALIASES.items():
+            if target in self.feature_index:
+                self.alias_map[str(alias).strip().lower()] = target
+
+        # Optional runtime alias injection via JSON env var.
+        # Example:
+        # SENSOR_ALIAS_JSON={"process_temp_k":"sensor_measurement_2"}
+        raw_aliases = os.getenv("SENSOR_ALIAS_JSON", "").strip()
+        if raw_aliases:
+            try:
+                parsed = json.loads(raw_aliases)
+                if isinstance(parsed, dict):
+                    for alias, target in parsed.items():
+                        norm_alias = str(alias).strip().lower().replace(" ", "_").replace("-", "_")
+                        norm_target = str(target).strip().lower().replace(" ", "_").replace("-", "_")
+                        if norm_target in self.feature_index:
+                            self.alias_map[norm_alias] = norm_target
+            except Exception:
+                pass
+
         self.series = defaultdict(lambda: defaultdict(deque))
         self.snapshots = defaultdict(list)
         self.last_known_good = defaultdict(lambda: np.zeros(self.num_features, dtype=np.float32))
@@ -83,10 +108,22 @@ class AsyncSensorFusionBuffer:
         self.step_counter = defaultdict(int)
 
     def _canonical_feature_name(self, feature_name):
-        normalized = str(feature_name).strip().lower().replace(" ", "_")
+        normalized = str(feature_name).strip().lower().replace(" ", "_").replace("-", "_")
         if normalized in self.feature_index:
             return normalized
-        return self.alias_map.get(normalized)
+
+        mapped = self.alias_map.get(normalized)
+        if mapped:
+            return mapped
+
+        # Allow modality prefixes like "thermal.process_temp_k".
+        if "." in normalized:
+            tail = normalized.split(".")[-1]
+            if tail in self.feature_index:
+                return tail
+            return self.alias_map.get(tail)
+
+        return None
 
     def process_feature(self, machine_id, feature_name, value, timestamp=None):
         canonical = self._canonical_feature_name(feature_name)

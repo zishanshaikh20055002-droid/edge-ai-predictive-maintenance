@@ -6,15 +6,26 @@ __pycache__/
 venv/
 env/
 .env
+.venv/
+.venv-wsl/
+.venv-wsl-gpu/
 
 # ---------------- DATA ----------------
 data/*.npy
 data/*.pkl
+data/external/
+data/multisource_train.npz
+data/multisource_train_report.json
 
 # ---------------- MODELS ----------------
 models/*.h5
 models/*.pt
 models/*.tflite
+models/best_multimodal_mtl.keras
+models/multisource_training_report.json
+models/multimodal_savedmodel/
+models/multimodal_eval_report.json
+models/training_result_card.md
 
 # ---------------- NOTEBOOK ----------------
 .ipynb_checkpoints/

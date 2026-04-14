@@ -38,10 +38,26 @@ MQTT_PORT   = int(os.getenv("MQTT_PORT", "1883"))
 WINDOW_SIZE = 30
 NUM_FEATURES = 14  # CMAPSS uses 14
 N_PASSES    = max(1, _env_int("MC_PASSES", 30))
+MC_PASSES_MULTIMODAL = max(1, _env_int("MC_PASSES_MULTIMODAL", 12))
 NOISE_STD   = max(0.0, _env_float("MC_NOISE_STD", 0.01))
 ASYNC_RESAMPLE_HZ = max(0.1, _env_float("ASYNC_RESAMPLE_HZ", 1.0))
 ASYNC_MAX_BUFFER_SECONDS = max(10.0, _env_float("ASYNC_MAX_BUFFER_SECONDS", 120.0))
 RNG         = np.random.default_rng()
+
+THERMAL_EMBED_DIM = 128
+VIBRATION_WINDOW = 256
+ACOUSTIC_WINDOW = 2048
+ELECTRICAL_WINDOW = 64
+ELECTRICAL_FEATURES = 4
+
+FAULT_CLASS_TO_COMPONENT = {
+    0: "stator",        # twf
+    1: "cooling",       # hdf
+    2: "power_supply",  # pwf
+    3: "rotor",         # osf
+    4: "lubrication",   # rnf
+    5: "bearing",       # bearing_fault
+}
 
 CMAPSS_FEATURE_NAMES = [
     "sensor_measurement_2",
@@ -96,6 +112,152 @@ def _to_ui_sensors(raw_features: np.ndarray) -> dict:
         "torque": _map_range(float(raw_features[2]), RAW_SENSOR_BOUNDS["torque"], UI_SENSOR_BOUNDS["torque"]),
         "tool_wear": _map_range(float(raw_features[3]), RAW_SENSOR_BOUNDS["tool_wear"], UI_SENSOR_BOUNDS["tool_wear"]),
         "speed": _map_range(float(raw_features[4]), RAW_SENSOR_BOUNDS["speed"], UI_SENSOR_BOUNDS["speed"]),
+    }
+
+
+def _resample_sequence(sequence: np.ndarray, target_len: int) -> np.ndarray:
+    sequence = np.asarray(sequence, dtype=np.float32)
+    if sequence.ndim == 1:
+        sequence = sequence.reshape(-1, 1)
+    if sequence.shape[0] == target_len:
+        return sequence.astype(np.float32)
+    if sequence.shape[0] <= 1:
+        return np.repeat(sequence[:1], target_len, axis=0).astype(np.float32)
+
+    src_x = np.linspace(0.0, 1.0, num=sequence.shape[0], dtype=np.float32)
+    dst_x = np.linspace(0.0, 1.0, num=target_len, dtype=np.float32)
+    out = np.zeros((target_len, sequence.shape[1]), dtype=np.float32)
+
+    for channel in range(sequence.shape[1]):
+        out[:, channel] = np.interp(dst_x, src_x, sequence[:, channel]).astype(np.float32)
+
+    return out.astype(np.float32)
+
+
+def _thermal_embed_from_process(process_window_data: np.ndarray, dim: int = THERMAL_EMBED_DIM) -> np.ndarray:
+    mean = np.mean(process_window_data, axis=0)
+    std = np.std(process_window_data, axis=0)
+    vmin = np.min(process_window_data, axis=0)
+    vmax = np.max(process_window_data, axis=0)
+    stats = np.concatenate([mean, std, vmin, vmax], axis=0).astype(np.float32)
+
+    if stats.shape[0] >= dim:
+        return stats[:dim].astype(np.float32)
+
+    repeats = int(np.ceil(dim / max(1, stats.shape[0])))
+    return np.tile(stats, repeats)[:dim].astype(np.float32)
+
+
+def _build_multimodal_inputs(process_batch: np.ndarray):
+    process = process_batch.astype(np.float32)
+    process_window = process[0]
+
+    vib_cols = [5, 9, 10]
+    vib_cols = [c if c < process_window.shape[1] else c % process_window.shape[1] for c in vib_cols]
+    vibration_src = process_window[:, vib_cols]
+    vibration = _resample_sequence(vibration_src, VIBRATION_WINDOW).reshape(1, VIBRATION_WINDOW, 3)
+
+    acoustic_src = np.mean(process_window, axis=1, keepdims=True)
+    acoustic = _resample_sequence(acoustic_src, ACOUSTIC_WINDOW).reshape(1, ACOUSTIC_WINDOW, 1)
+
+    elec_cols = [0, 1, 2, 4]
+    elec_cols = [c if c < process_window.shape[1] else c % process_window.shape[1] for c in elec_cols]
+    electrical_src = process_window[:, elec_cols]
+    electrical = _resample_sequence(electrical_src, ELECTRICAL_WINDOW).reshape(
+        1,
+        ELECTRICAL_WINDOW,
+        ELECTRICAL_FEATURES,
+    )
+
+    thermal = _thermal_embed_from_process(process_window).reshape(1, THERMAL_EMBED_DIM)
+
+    return [
+        process.astype(np.float32),
+        vibration.astype(np.float32),
+        acoustic.astype(np.float32),
+        electrical.astype(np.float32),
+        thermal.astype(np.float32),
+    ]
+
+
+def _parse_multimodal_outputs(outputs):
+    if isinstance(outputs, dict):
+        rul = outputs.get("head_rul")
+        faults = outputs.get("head_faults")
+        anomaly = outputs.get("head_anomaly_score")
+    else:
+        rul, faults, anomaly = outputs
+
+    rul_value = float(np.asarray(rul).reshape(-1)[0])
+    fault_vector = np.asarray(faults).reshape(-1).astype(np.float32)
+    anomaly_value = float(np.asarray(anomaly).reshape(-1)[0])
+    return rul_value, fault_vector, anomaly_value
+
+
+def _stage_probs_from_rul_anomaly(rul: float, anomaly_score: float) -> list[float]:
+    critical = float(np.clip(((90.0 - rul) / 90.0), 0.0, 1.0) * 0.70 + anomaly_score * 0.55)
+    healthy = float(np.clip(((rul - 110.0) / 140.0), 0.0, 1.0) * (1.0 - anomaly_score))
+    warning = float(max(0.0, 1.0 - critical - healthy))
+
+    probs = np.asarray([healthy, warning, critical], dtype=np.float32)
+    probs = np.clip(probs, 1e-6, None)
+    probs = probs / np.sum(probs)
+    return probs.tolist()
+
+
+def _fault_component_probs_from_head(fault_probs: np.ndarray) -> dict[str, float]:
+    vector = np.asarray(fault_probs, dtype=np.float32).reshape(-1)
+    component_probs: dict[str, float] = defaultdict(float)
+
+    for idx, value in enumerate(vector):
+        component = FAULT_CLASS_TO_COMPONENT.get(idx)
+        if component is None:
+            continue
+        component_probs[component] = max(component_probs[component], float(np.clip(value, 0.0, 1.0)))
+
+    if not component_probs:
+        return {}
+
+    total = sum(component_probs.values())
+    if total <= 0:
+        return {}
+
+    return {
+        key: float(val / total)
+        for key, val in component_probs.items()
+    }
+
+
+def _run_multimodal_prediction(keras_model, base_sample: np.ndarray) -> dict:
+    rul_predictions = []
+    fault_predictions = []
+    anomaly_predictions = []
+
+    for _ in range(MC_PASSES_MULTIMODAL):
+        noisy = base_sample
+        if NOISE_STD > 0.0:
+            noisy = base_sample + RNG.normal(0.0, NOISE_STD, base_sample.shape).astype(np.float32)
+
+        model_inputs = _build_multimodal_inputs(noisy.astype(np.float32))
+        outputs = keras_model(model_inputs, training=True)
+        rul, faults, anomaly = _parse_multimodal_outputs(outputs)
+
+        rul_predictions.append(rul)
+        fault_predictions.append(faults)
+        anomaly_predictions.append(anomaly)
+
+    rul_mean = float(np.mean(rul_predictions))
+    rul_std = float(np.std(rul_predictions))
+    fault_mean = np.mean(np.asarray(fault_predictions, dtype=np.float32), axis=0)
+    anomaly_mean = float(np.mean(anomaly_predictions))
+    stage_probs = _stage_probs_from_rul_anomaly(rul_mean, anomaly_mean)
+
+    return {
+        "rul_mean": rul_mean,
+        "rul_std": rul_std,
+        "stage_probs": stage_probs,
+        "anomaly_score": anomaly_mean,
+        "fault_component_probabilities": _fault_component_probs_from_head(fault_mean),
     }
 
 ingestion_buffer = HardwareAgnosticBuffer(window_size=WINDOW_SIZE, num_features=NUM_FEATURES)
@@ -187,17 +349,372 @@ def _build_output_mapping(output_details):
 
     return mapping
 
-def start_subscriber(interpreter, input_details, output_details, scaler, manager, metrics, fault_localizer=None):
+
+def _build_multimodal_tflite_output_mapping(output_details, expected_fault_classes: int = 6):
+    """Infer output tensor indices for multimodal TFLite models."""
+    mapping = {
+        "rul_index": None,
+        "faults_index": None,
+        "anomaly_index": None,
+    }
+
+    scalar_candidates = []
+    vector_candidates = []
+
+    for detail in output_details:
+        idx = detail["index"]
+        name = str(detail.get("name", "")).lower()
+        shape = detail.get("shape", [])
+        size = int(np.prod(shape)) if shape is not None else 0
+
+        if size == 1:
+            if "rul" in name and mapping["rul_index"] is None:
+                mapping["rul_index"] = idx
+            elif "anomaly" in name and mapping["anomaly_index"] is None:
+                mapping["anomaly_index"] = idx
+            else:
+                scalar_candidates.append(idx)
+            continue
+
+        if size > 1:
+            if "fault" in name and mapping["faults_index"] is None:
+                mapping["faults_index"] = idx
+            else:
+                vector_candidates.append((idx, size))
+
+    if mapping["faults_index"] is None and vector_candidates:
+        for idx, size in vector_candidates:
+            if size >= expected_fault_classes:
+                mapping["faults_index"] = idx
+                break
+    if mapping["faults_index"] is None and vector_candidates:
+        mapping["faults_index"] = max(vector_candidates, key=lambda x: x[1])[0]
+
+    if mapping["rul_index"] is None and scalar_candidates:
+        mapping["rul_index"] = scalar_candidates.pop(0)
+    if mapping["anomaly_index"] is None and scalar_candidates:
+        mapping["anomaly_index"] = scalar_candidates.pop(0)
+
+    return mapping
+
+
+def _build_multimodal_tflite_input_mapping(input_details):
+    """Infer input tensor indices for multimodal TFLite models."""
+    mapping = {
+        "process": None,
+        "vibration": None,
+        "acoustic": None,
+        "electrical": None,
+        "thermal": None,
+    }
+
+    shape_to_key = {
+        (WINDOW_SIZE, NUM_FEATURES): "process",
+        (VIBRATION_WINDOW, 3): "vibration",
+        (ACOUSTIC_WINDOW, 1): "acoustic",
+        (ELECTRICAL_WINDOW, ELECTRICAL_FEATURES): "electrical",
+        (THERMAL_EMBED_DIM,): "thermal",
+    }
+
+    for detail in input_details:
+        idx = detail["index"]
+        name = str(detail.get("name", "")).lower()
+        shape = tuple(int(x) for x in detail.get("shape", []) if int(x) > 0)
+        tail = shape[1:] if len(shape) > 1 else shape
+
+        assigned = None
+        if "process" in name:
+            assigned = "process"
+        elif "vibration" in name:
+            assigned = "vibration"
+        elif "acoustic" in name:
+            assigned = "acoustic"
+        elif "electrical" in name:
+            assigned = "electrical"
+        elif "thermal" in name:
+            assigned = "thermal"
+        elif tail in shape_to_key:
+            assigned = shape_to_key[tail]
+
+        if assigned and mapping[assigned] is None:
+            mapping[assigned] = idx
+
+    missing = [key for key, value in mapping.items() if value is None]
+    if missing:
+        raise RuntimeError(
+            f"Could not infer multimodal TFLite input tensors for: {missing}. "
+            f"Available tensor names: {[str(d.get('name', '')) for d in input_details]}"
+        )
+
+    return mapping
+
+
+def _run_multimodal_tflite_prediction(interpreter, input_map, output_map, base_sample: np.ndarray) -> dict:
+    rul_predictions = []
+    fault_predictions = []
+    anomaly_predictions = []
+
+    for _ in range(MC_PASSES_MULTIMODAL):
+        noisy = base_sample
+        if NOISE_STD > 0.0:
+            noisy = base_sample + RNG.normal(0.0, NOISE_STD, base_sample.shape).astype(np.float32)
+
+        model_inputs = _build_multimodal_inputs(noisy.astype(np.float32))
+        interpreter.set_tensor(input_map["process"], model_inputs[0])
+        interpreter.set_tensor(input_map["vibration"], model_inputs[1])
+        interpreter.set_tensor(input_map["acoustic"], model_inputs[2])
+        interpreter.set_tensor(input_map["electrical"], model_inputs[3])
+        interpreter.set_tensor(input_map["thermal"], model_inputs[4])
+        interpreter.invoke()
+
+        rul = float(interpreter.get_tensor(output_map["rul_index"]).reshape(-1)[0])
+        anomaly = float(interpreter.get_tensor(output_map["anomaly_index"]).reshape(-1)[0])
+
+        faults = None
+        if output_map.get("faults_index") is not None:
+            faults = interpreter.get_tensor(output_map["faults_index"]).reshape(-1).astype(np.float32)
+
+        rul_predictions.append(rul)
+        anomaly_predictions.append(anomaly)
+        if faults is not None:
+            fault_predictions.append(faults)
+
+    rul_mean = float(np.mean(rul_predictions))
+    rul_std = float(np.std(rul_predictions))
+    anomaly_mean = float(np.mean(anomaly_predictions))
+    stage_probs = _stage_probs_from_rul_anomaly(rul_mean, anomaly_mean)
+
+    fault_component_probabilities = {}
+    if fault_predictions:
+        fault_mean = np.mean(np.asarray(fault_predictions, dtype=np.float32), axis=0)
+        fault_component_probabilities = _fault_component_probs_from_head(fault_mean)
+
+    return {
+        "rul_mean": rul_mean,
+        "rul_std": rul_std,
+        "stage_probs": stage_probs,
+        "anomaly_score": anomaly_mean,
+        "fault_component_probabilities": fault_component_probabilities,
+    }
+
+
+def _invoke_multimodal_savedmodel(signature, model_inputs):
+    positional_specs, keyword_specs = signature.structured_input_signature
+
+    if keyword_specs:
+        kwargs = {}
+        remaining = set(keyword_specs.keys())
+
+        by_name = {
+            "process": model_inputs[0],
+            "vibration": model_inputs[1],
+            "acoustic": model_inputs[2],
+            "electrical": model_inputs[3],
+            "thermal": model_inputs[4],
+        }
+
+        for key in list(remaining):
+            lowered = str(key).lower()
+            if "process" in lowered:
+                kwargs[key] = by_name["process"]
+                remaining.remove(key)
+            elif "vibration" in lowered:
+                kwargs[key] = by_name["vibration"]
+                remaining.remove(key)
+            elif "acoustic" in lowered:
+                kwargs[key] = by_name["acoustic"]
+                remaining.remove(key)
+            elif "electrical" in lowered:
+                kwargs[key] = by_name["electrical"]
+                remaining.remove(key)
+            elif "thermal" in lowered:
+                kwargs[key] = by_name["thermal"]
+                remaining.remove(key)
+
+        shape_to_input = {
+            (WINDOW_SIZE, NUM_FEATURES): model_inputs[0],
+            (VIBRATION_WINDOW, 3): model_inputs[1],
+            (ACOUSTIC_WINDOW, 1): model_inputs[2],
+            (ELECTRICAL_WINDOW, ELECTRICAL_FEATURES): model_inputs[3],
+            (THERMAL_EMBED_DIM,): model_inputs[4],
+        }
+
+        for key in list(remaining):
+            spec = keyword_specs[key]
+            shape = tuple(
+                int(x)
+                for x in getattr(spec, "shape", [])
+                if x is not None and int(x) > 0
+            )
+            tail = shape[1:] if len(shape) > 1 else shape
+            if tail in shape_to_input:
+                kwargs[key] = shape_to_input[tail]
+                remaining.remove(key)
+
+        if remaining:
+            raise RuntimeError(f"Unable to map SavedModel inputs for keys: {sorted(remaining)}")
+
+        return signature(**kwargs)
+
+    if positional_specs:
+        if len(positional_specs) == 1 and isinstance(positional_specs[0], (list, tuple)):
+            return signature(model_inputs)
+        if len(positional_specs) == 5:
+            return signature(*model_inputs)
+
+    raise RuntimeError("Unsupported SavedModel serving signature layout")
+
+
+def _parse_savedmodel_outputs(outputs):
+    if isinstance(outputs, dict):
+        rul = None
+        faults = None
+        anomaly = None
+        scalar_candidates = []
+        vector_candidates = []
+
+        for name, value in outputs.items():
+            arr = np.asarray(value)
+            size = int(arr.size)
+            lowered = str(name).lower()
+
+            if size == 1:
+                if "rul" in lowered and rul is None:
+                    rul = arr
+                elif "anomaly" in lowered and anomaly is None:
+                    anomaly = arr
+                else:
+                    scalar_candidates.append(arr)
+            elif size > 1:
+                if "fault" in lowered and faults is None:
+                    faults = arr
+                else:
+                    vector_candidates.append(arr)
+
+        if faults is None and vector_candidates:
+            faults = max(vector_candidates, key=lambda x: x.size)
+        if rul is None and scalar_candidates:
+            rul = scalar_candidates.pop(0)
+        if anomaly is None and scalar_candidates:
+            anomaly = scalar_candidates.pop(0)
+
+        if rul is None or anomaly is None:
+            raise RuntimeError("SavedModel outputs must include scalar RUL and anomaly tensors")
+
+        rul_value = float(np.asarray(rul).reshape(-1)[0])
+        fault_vector = np.asarray(faults).reshape(-1).astype(np.float32) if faults is not None else np.zeros((0,), dtype=np.float32)
+        anomaly_value = float(np.asarray(anomaly).reshape(-1)[0])
+        return rul_value, fault_vector, anomaly_value
+
+    if isinstance(outputs, (list, tuple)) and len(outputs) >= 3:
+        rul = float(np.asarray(outputs[0]).reshape(-1)[0])
+        faults = np.asarray(outputs[1]).reshape(-1).astype(np.float32)
+        anomaly = float(np.asarray(outputs[2]).reshape(-1)[0])
+        return rul, faults, anomaly
+
+    raise RuntimeError("Unsupported SavedModel output structure")
+
+
+def _run_multimodal_savedmodel_prediction(saved_model_signature, base_sample: np.ndarray) -> dict:
+    rul_predictions = []
+    fault_predictions = []
+    anomaly_predictions = []
+
+    for _ in range(MC_PASSES_MULTIMODAL):
+        noisy = base_sample
+        if NOISE_STD > 0.0:
+            noisy = base_sample + RNG.normal(0.0, NOISE_STD, base_sample.shape).astype(np.float32)
+
+        model_inputs = _build_multimodal_inputs(noisy.astype(np.float32))
+        outputs = _invoke_multimodal_savedmodel(saved_model_signature, model_inputs)
+        rul, faults, anomaly = _parse_savedmodel_outputs(outputs)
+
+        rul_predictions.append(rul)
+        anomaly_predictions.append(anomaly)
+        if faults.size:
+            fault_predictions.append(faults)
+
+    rul_mean = float(np.mean(rul_predictions))
+    rul_std = float(np.std(rul_predictions))
+    anomaly_mean = float(np.mean(anomaly_predictions))
+    stage_probs = _stage_probs_from_rul_anomaly(rul_mean, anomaly_mean)
+
+    fault_component_probabilities = {}
+    if fault_predictions:
+        fault_mean = np.mean(np.asarray(fault_predictions, dtype=np.float32), axis=0)
+        fault_component_probabilities = _fault_component_probs_from_head(fault_mean)
+
+    return {
+        "rul_mean": rul_mean,
+        "rul_std": rul_std,
+        "stage_probs": stage_probs,
+        "anomaly_score": anomaly_mean,
+        "fault_component_probabilities": fault_component_probabilities,
+    }
+
+def start_subscriber(runtime_bundle, manager, metrics, fault_localizer=None):
     from src.database import insert_data
     from src.sanitize import sanitize_sensor_dict
 
-    output_map = _build_output_mapping(output_details)
+    runtime_mode = str(runtime_bundle.get("mode", "tflite")).strip().lower()
+    model_path = str(runtime_bundle.get("model_path", ""))
+    scaler = runtime_bundle.get("scaler")
+
+    if scaler is None:
+        raise RuntimeError("runtime_bundle missing scaler")
+
+    interpreter = runtime_bundle.get("interpreter")
+    input_details = runtime_bundle.get("input_details", [])
+    output_details = runtime_bundle.get("output_details", [])
+    keras_model = runtime_bundle.get("keras_model")
+    saved_model_signature = runtime_bundle.get("saved_model_signature")
+
+    output_map = None
+    multimodal_input_map = None
+    if runtime_mode == "tflite":
+        if interpreter is None or not input_details or not output_details:
+            raise RuntimeError("runtime_bundle missing TFLite interpreter details")
+        output_map = _build_output_mapping(output_details)
+    elif runtime_mode == "multimodal_keras":
+        if keras_model is None:
+            raise RuntimeError("runtime_bundle missing Keras model")
+    elif runtime_mode == "multimodal_savedmodel":
+        if saved_model_signature is None:
+            raise RuntimeError("runtime_bundle missing SavedModel serving signature")
+    elif runtime_mode == "multimodal_tflite":
+        if interpreter is None or not input_details or not output_details:
+            raise RuntimeError("runtime_bundle missing multimodal TFLite interpreter details")
+        multimodal_input_map = _build_multimodal_tflite_input_mapping(input_details)
+        output_map = _build_multimodal_tflite_output_mapping(output_details)
+        if output_map["rul_index"] is None or output_map["anomaly_index"] is None:
+            raise RuntimeError(
+                "multimodal_tflite outputs must include RUL and anomaly score tensors"
+            )
+    else:
+        raise RuntimeError(f"Unsupported runtime mode: {runtime_mode}")
+
     last_inferred_step = defaultdict(int)
 
-    if output_map["direct_uncertainty"]:
-        logger.info("[MQTT] Using direct uncertainty outputs from TFLite model")
+    if runtime_mode == "tflite":
+        if output_map["direct_uncertainty"]:
+            logger.info(f"[MQTT] Runtime=tflite direct-uncertainty model={model_path}")
+        else:
+            logger.info(f"[MQTT] Runtime=tflite MC-sampling model={model_path}")
+    elif runtime_mode == "multimodal_tflite":
+        logger.info(
+            f"[MQTT] Runtime=multimodal_tflite MC-passes={MC_PASSES_MULTIMODAL} "
+            f"model={model_path}"
+        )
+    elif runtime_mode == "multimodal_savedmodel":
+        logger.info(
+            f"[MQTT] Runtime=multimodal_savedmodel MC-passes={MC_PASSES_MULTIMODAL} "
+            f"model={model_path}"
+        )
     else:
-        logger.info("[MQTT] Using Monte Carlo sampling over standard TFLite outputs")
+        logger.info(
+            f"[MQTT] Runtime=multimodal_keras MC-passes={MC_PASSES_MULTIMODAL} "
+            f"model={model_path}"
+        )
 
     def on_connect(client, userdata, flags, rc, properties=None):
         if rc == 0:
@@ -269,8 +786,32 @@ def start_subscriber(interpreter, input_details, output_details, scaler, manager
         clean_features = raw_window[0][-1]
         
         t0 = time.perf_counter()
+        fault_component_probabilities = {}
 
-        if output_map["direct_uncertainty"]:
+        if runtime_mode == "multimodal_keras":
+            inference = _run_multimodal_prediction(keras_model, base_sample)
+            rul_mean = float(inference["rul_mean"])
+            rul_std = float(inference["rul_std"])
+            stage_probs = list(inference["stage_probs"])
+            fault_component_probabilities = dict(inference["fault_component_probabilities"])
+        elif runtime_mode == "multimodal_savedmodel":
+            inference = _run_multimodal_savedmodel_prediction(saved_model_signature, base_sample)
+            rul_mean = float(inference["rul_mean"])
+            rul_std = float(inference["rul_std"])
+            stage_probs = list(inference["stage_probs"])
+            fault_component_probabilities = dict(inference["fault_component_probabilities"])
+        elif runtime_mode == "multimodal_tflite":
+            inference = _run_multimodal_tflite_prediction(
+                interpreter,
+                multimodal_input_map,
+                output_map,
+                base_sample,
+            )
+            rul_mean = float(inference["rul_mean"])
+            rul_std = float(inference["rul_std"])
+            stage_probs = list(inference["stage_probs"])
+            fault_component_probabilities = dict(inference["fault_component_probabilities"])
+        elif output_map["direct_uncertainty"]:
             interpreter.set_tensor(input_details[0]["index"], base_sample)
             interpreter.invoke()
 
@@ -325,6 +866,31 @@ def start_subscriber(interpreter, input_details, output_details, scaler, manager
             raw_features=clean_features,
         )
 
+        if fault_component_probabilities:
+            diagnosis["fault_component_probabilities"] = {
+                k: round(float(v), 4)
+                for k, v in fault_component_probabilities.items()
+            }
+
+            top_component = max(
+                fault_component_probabilities,
+                key=fault_component_probabilities.get,
+            )
+            top_confidence = float(fault_component_probabilities[top_component])
+            if top_confidence >= float(diagnosis.get("fault_confidence", 0.0)):
+                diagnosis["fault_component"] = top_component
+                diagnosis["fault_confidence"] = round(top_confidence, 4)
+                if top_component in FAULT_PLAYBOOK:
+                    diagnosis["fault_type"] = FAULT_PLAYBOOK[top_component]["fault_type"]
+                    diagnosis["probable_causes"] = FAULT_PLAYBOOK[top_component]["probable_causes"]
+                    diagnosis["recommended_actions"] = FAULT_PLAYBOOK[top_component]["recommended_actions"]
+
+            diagnosis.setdefault("fault_model_source", runtime_mode)
+            diagnosis.setdefault(
+                "fault_model_version",
+                os.path.basename(model_path) if model_path else runtime_mode,
+            )
+
         ml_fault = fault_localizer.predict({
             "machine_id": machine_id,
             "RUL": prediction,
@@ -354,8 +920,8 @@ def start_subscriber(interpreter, input_details, output_details, scaler, manager
                 ]
             diagnosis["diagnosis_version"] = "v2.0-hybrid-ml"
         else:
-            diagnosis["fault_model_source"] = "rules"
-            diagnosis["fault_model_version"] = "rules-only"
+            diagnosis.setdefault("fault_model_source", "rules")
+            diagnosis.setdefault("fault_model_version", "rules-only")
             diagnosis["diagnosis_version"] = "v1.0-rule-fusion"
 
         diagnosis.update(evaluate_alarm({

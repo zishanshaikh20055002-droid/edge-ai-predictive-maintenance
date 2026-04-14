@@ -26,6 +26,8 @@ import time
 
 import paho.mqtt.client as mqtt
 
+from src.sensor_contract import RealSensorPacket, to_feature_updates
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,15 +154,19 @@ class HardwareBridge:
 
             try:
                 packet = json.loads(line.decode(errors="ignore").strip())
-                feature = str(packet.get("feature", "")).strip().lower()
-                value = packet.get("value")
-                timestamp = packet.get("timestamp")
-                machine_id = str(packet.get("machine_id", MACHINE_ID)).strip().upper() or MACHINE_ID
+                canonical_packet = RealSensorPacket(**packet)
+                updates = to_feature_updates(canonical_packet)
 
-                if feature not in FEATURE_RATES_HZ:
-                    continue
+                for update in updates:
+                    feature = str(update["feature"]).strip().lower()
+                    value = float(update["value"])
+                    timestamp = update.get("timestamp")
+                    machine_id = str(update["machine_id"]).strip().upper() or MACHINE_ID
 
-                self.publish_feature(feature, value, timestamp=timestamp, machine_id=machine_id)
+                    if feature not in FEATURE_RATES_HZ:
+                        continue
+
+                    self.publish_feature(feature, value, timestamp=timestamp, machine_id=machine_id)
             except Exception:
                 continue
 

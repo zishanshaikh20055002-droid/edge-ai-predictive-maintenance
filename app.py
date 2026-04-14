@@ -59,19 +59,137 @@ from src.retraining import AutoRetrainCoordinator
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Paths ─────────────────────────────────────────────────────
-MODEL_PATH  = os.path.join(BASE_DIR, "models", "model_cmapss_int8.tflite")
-SCALER_PATH = os.path.join(BASE_DIR, "data", "scaler_cmapss.pkl")
+DEFAULT_TFLITE_MODEL_PATH = os.path.join(BASE_DIR, "models", "model_cmapss_int8.tflite")
+DEFAULT_MULTIMODAL_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_multimodal_mtl.keras")
+DEFAULT_MULTIMODAL_SAVEDMODEL_PATH = os.path.join(BASE_DIR, "models", "multimodal_savedmodel")
+DEFAULT_MULTIMODAL_TFLITE_MODEL_PATH = os.path.join(BASE_DIR, "models", "model_multimodal_portable.tflite")
+RUNTIME_MODEL_PATH = os.getenv("RUNTIME_MODEL_PATH", "").strip()
+RUNTIME_MODEL_MODE = os.getenv("RUNTIME_MODEL_MODE", "auto").strip().lower()
+SCALER_PATH = os.getenv("RUNTIME_SCALER_PATH", os.path.join(BASE_DIR, "data", "scaler_cmapss.pkl"))
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "mosquitto")
 MQTT_PORT   = int(os.getenv("MQTT_PORT", "1883"))
 
 # ── Load model ────────────────────────────────────────────────
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
-input_details  = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+class _IdentityScaler:
+    def transform(self, x):
+        return x
 
-scaler = joblib.load(SCALER_PATH)
+
+def _compact_error(exc: Exception, limit: int = 280) -> str:
+    msg = str(exc).replace("\n", " ").strip()
+    if len(msg) > limit:
+        msg = msg[: limit - 3].rstrip() + "..."
+    return msg
+
+
+def _load_scaler(path: str):
+    try:
+        loaded = joblib.load(path)
+        print(f"[MODEL] Loaded scaler: {path}")
+        return loaded
+    except Exception as exc:
+        print(f"[MODEL] Failed to load scaler '{path}' ({exc}); using identity scaler")
+        return _IdentityScaler()
+
+
+def _resolve_runtime_candidates() -> list[str]:
+    candidates = []
+    if RUNTIME_MODEL_PATH:
+        candidates.append(RUNTIME_MODEL_PATH)
+    else:
+        if os.path.exists(DEFAULT_MULTIMODAL_MODEL_PATH):
+            candidates.append(DEFAULT_MULTIMODAL_MODEL_PATH)
+        if os.path.exists(os.path.join(DEFAULT_MULTIMODAL_SAVEDMODEL_PATH, "saved_model.pb")):
+            candidates.append(DEFAULT_MULTIMODAL_SAVEDMODEL_PATH)
+        if os.path.exists(DEFAULT_MULTIMODAL_TFLITE_MODEL_PATH):
+            candidates.append(DEFAULT_MULTIMODAL_TFLITE_MODEL_PATH)
+        candidates.append(DEFAULT_TFLITE_MODEL_PATH)
+
+    deduped = []
+    for path in candidates:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
+
+
+def _infer_mode(path: str) -> str:
+    if os.path.isdir(path) and os.path.exists(os.path.join(path, "saved_model.pb")):
+        return "multimodal_savedmodel"
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".keras", ".h5"}:
+        return "multimodal_keras"
+    if ext == ".tflite" and "multimodal" in os.path.basename(path).lower():
+        return "multimodal_tflite"
+    return "tflite"
+
+
+def _load_runtime_bundle():
+    scaler_obj = _load_scaler(SCALER_PATH)
+    candidates = _resolve_runtime_candidates()
+    last_error = ""
+
+    for path in candidates:
+        mode = RUNTIME_MODEL_MODE if RUNTIME_MODEL_MODE != "auto" else _infer_mode(path)
+
+        if not os.path.exists(path):
+            last_error = f"missing model file: {path}"
+            continue
+
+        try:
+            if mode == "multimodal_keras":
+                keras_model = tf.keras.models.load_model(path, compile=False)
+                print(f"[MODEL] Runtime mode=multimodal_keras, model={path}")
+                return {
+                    "mode": "multimodal_keras",
+                    "model_path": path,
+                    "keras_model": keras_model,
+                    "scaler": scaler_obj,
+                }
+
+            if mode == "multimodal_savedmodel":
+                saved_model = tf.saved_model.load(path)
+                signature = saved_model.signatures.get("serving_default")
+                if signature is None:
+                    raise RuntimeError("SavedModel missing serving_default signature")
+                print(f"[MODEL] Runtime mode=multimodal_savedmodel, model={path}")
+                return {
+                    "mode": "multimodal_savedmodel",
+                    "model_path": path,
+                    "saved_model": saved_model,
+                    "saved_model_signature": signature,
+                    "scaler": scaler_obj,
+                }
+
+            if mode in {"tflite", "multimodal_tflite"}:
+                interpreter = tf.lite.Interpreter(model_path=path)
+                interpreter.allocate_tensors()
+                print(f"[MODEL] Runtime mode={mode}, model={path}")
+                return {
+                    "mode": mode,
+                    "model_path": path,
+                    "interpreter": interpreter,
+                    "input_details": interpreter.get_input_details(),
+                    "output_details": interpreter.get_output_details(),
+                    "scaler": scaler_obj,
+                }
+
+            raise RuntimeError(f"unsupported runtime mode requested: {mode}")
+        except Exception as exc:
+            short_error = _compact_error(exc)
+            if "Could not deserialize class 'Functional'" in short_error:
+                short_error += " (Keras model/version mismatch likely)"
+            last_error = short_error
+            print(f"[MODEL] Failed loading {path} in mode={mode}: {short_error}")
+
+    raise RuntimeError(
+        "Unable to load a runtime model. "
+        f"Checked: {candidates}. Last error: {last_error}"
+    )
+
+
+runtime_bundle = _load_runtime_bundle()
 fault_localizer = FaultLocalizer()
 
 # ── Metrics bundle ────────────────────────────────────────────
@@ -148,7 +266,7 @@ async def startup():
 
     thread = threading.Thread(
         target=start_subscriber,
-        args=(interpreter, input_details, output_details, scaler, manager, metrics, fault_localizer),
+        args=(runtime_bundle, manager, metrics, fault_localizer),
         daemon=True,
         name="mqtt-subscriber",
     )

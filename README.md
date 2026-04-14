@@ -655,6 +655,150 @@ Training scaffold:
 src/train_multimodal_mtl.py
 
 
+14.7 Advanced Multi-Dataset Training (Imbalance-Optimized)
+
+The multimodal trainer now supports fused training across:
+
+ai4i2020
+
+CWRU Bearing Dataset
+
+MIMII Dataset
+
+MetroPT-3 Dataset
+
+Edge-IIoTset
+
+Implemented optimization techniques:
+
+Class-balanced weighting using effective number of samples
+
+Class-weighted focal losses for fault/anomaly heads
+
+Minority-aware sample weighting per output head
+
+Weighted bootstrap resampling for long-tail classes
+
+Real-sensor-ready alias mapping for asynchronous feature streams
+
+Expected dataset layout:
+
+data/
+
+        ai4i2020.csv
+
+        external/
+
+                CWRU/
+
+                MIMII/
+
+                MetroPT-3/
+
+                Edge-IIoTset/
+
+Build fused dataset and train:
+
+python -m src.train_multimodal_mtl --rebuild-dataset --epochs 40 --batch-size 32
+
+Reuse existing fused dataset without rebuilding:
+
+python -m src.train_multimodal_mtl --epochs 40 --batch-size 32
+
+Disable bootstrap (ablation/debug):
+
+python -m src.train_multimodal_mtl --no-bootstrap
+
+One-command GPU training launcher from Windows PowerShell (runs in WSL):
+
+.\scripts\start-gpu-training.ps1 -ProbeOnly
+
+.\scripts\start-gpu-training.ps1
+
+.\scripts\start-gpu-training.ps1 -RebuildDataset -Epochs 40 -BatchSize 32
+
+Artifacts produced:
+
+data/multisource_train.npz (fused training tensor pack)
+
+data/multisource_train_report.json (source mix statistics)
+
+models/best_multimodal_mtl.keras (best checkpoint)
+
+models/multisource_training_report.json (imbalance + training metadata)
+
+
+14.8 Portable Multimodal Runtime Artifact (Windows + WSL)
+
+Primary portable path (recommended): export TensorFlow SavedModel from WSL:
+
+powershell -ExecutionPolicy Bypass -File scripts/export-multimodal-savedmodel.ps1
+
+Default output directory:
+
+models/multimodal_savedmodel
+
+Runtime configuration for full multimodal inference:
+
+RUNTIME_MODEL_MODE=multimodal_savedmodel
+
+RUNTIME_MODEL_PATH=models/multimodal_savedmodel
+
+Optional path: export multimodal TFLite artifact:
+
+python -m src.convert_tflite_multimodal --quantization float16
+
+Default TFLite output:
+
+models/model_multimodal_portable.tflite
+
+Note:
+
+Current multimodal BiLSTM graph may require Select TF Ops (Flex) for TFLite runtime.
+If your interpreter does not include Flex delegate support, use SavedModel mode.
+
+Runtime configuration for full multimodal inference:
+
+RUNTIME_MODEL_MODE=multimodal_savedmodel or multimodal_tflite
+
+RUNTIME_MODEL_PATH=models/multimodal_savedmodel or models/model_multimodal_portable.tflite
+
+Auto-runtime candidate order (when RUNTIME_MODEL_PATH is unset):
+
+models/best_multimodal_mtl.keras (if loadable)
+
+models/multimodal_savedmodel
+
+models/model_multimodal_portable.tflite
+
+models/model_cmapss_int8.tflite (single-input fallback)
+
+
+14.9 One-Command Verification Flow
+
+Windows quick verification:
+
+powershell -ExecutionPolicy Bypass -File scripts/verify-runtime.ps1
+
+Windows quick verification (force SavedModel runtime mode):
+
+powershell -ExecutionPolicy Bypass -File scripts/verify-runtime.ps1 -ForceSavedModelMode
+
+Windows + WSL multimodal evaluation verification:
+
+powershell -ExecutionPolicy Bypass -File scripts/verify-runtime.ps1 -RunWslMultimodalEval
+
+WSL helper script used by the verification flow:
+
+scripts/evaluate_multimodal_mtl_wsl.sh
+
+SavedModel export helpers:
+
+scripts/export-multimodal-savedmodel.ps1
+
+scripts/export_savedmodel_multimodal_wsl.sh
+
+
 ---
 
 15. Use Cases
