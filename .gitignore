@@ -41,3 +41,5 @@ Thumbs.db
 .vscode/
 .idea/
 data/*.db
+data/*.db-shm
+data/*.db-wal

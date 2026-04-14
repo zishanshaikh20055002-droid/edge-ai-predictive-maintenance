@@ -350,6 +350,24 @@ def _build_output_mapping(output_details):
     return mapping
 
 
+def _read_tflite_output_tensor(interpreter, tensor_detail: dict) -> np.ndarray:
+    """Read an output tensor and dequantize integer outputs when needed."""
+    tensor = interpreter.get_tensor(tensor_detail["index"])
+    arr = np.asarray(tensor)
+
+    if arr.dtype in (np.int8, np.uint8, np.int16, np.int32):
+        qparams = tensor_detail.get("quantization_parameters") or {}
+        scales = np.asarray(qparams.get("scales", []), dtype=np.float32).reshape(-1)
+        zero_points = np.asarray(qparams.get("zero_points", []), dtype=np.float32).reshape(-1)
+
+        if scales.size > 0 and float(scales[0]) > 0.0:
+            scale = float(scales[0])
+            zero_point = float(zero_points[0]) if zero_points.size > 0 else 0.0
+            return (arr.astype(np.float32) - zero_point) * scale
+
+    return arr.astype(np.float32)
+
+
 def _build_multimodal_tflite_output_mapping(output_details, expected_fault_classes: int = 6):
     """Infer output tensor indices for multimodal TFLite models."""
     mapping = {
@@ -449,7 +467,13 @@ def _build_multimodal_tflite_input_mapping(input_details):
     return mapping
 
 
-def _run_multimodal_tflite_prediction(interpreter, input_map, output_map, base_sample: np.ndarray) -> dict:
+def _run_multimodal_tflite_prediction(
+    interpreter,
+    input_map,
+    output_map,
+    output_details_by_index,
+    base_sample: np.ndarray,
+) -> dict:
     rul_predictions = []
     fault_predictions = []
     anomaly_predictions = []
@@ -467,12 +491,15 @@ def _run_multimodal_tflite_prediction(interpreter, input_map, output_map, base_s
         interpreter.set_tensor(input_map["thermal"], model_inputs[4])
         interpreter.invoke()
 
-        rul = float(interpreter.get_tensor(output_map["rul_index"]).reshape(-1)[0])
-        anomaly = float(interpreter.get_tensor(output_map["anomaly_index"]).reshape(-1)[0])
+        rul_detail = output_details_by_index[output_map["rul_index"]]
+        anomaly_detail = output_details_by_index[output_map["anomaly_index"]]
+        rul = float(_read_tflite_output_tensor(interpreter, rul_detail).reshape(-1)[0])
+        anomaly = float(_read_tflite_output_tensor(interpreter, anomaly_detail).reshape(-1)[0])
 
         faults = None
         if output_map.get("faults_index") is not None:
-            faults = interpreter.get_tensor(output_map["faults_index"]).reshape(-1).astype(np.float32)
+            faults_detail = output_details_by_index[output_map["faults_index"]]
+            faults = _read_tflite_output_tensor(interpreter, faults_detail).reshape(-1).astype(np.float32)
 
         rul_predictions.append(rul)
         anomaly_predictions.append(anomaly)
@@ -671,6 +698,7 @@ def start_subscriber(runtime_bundle, manager, metrics, fault_localizer=None):
 
     output_map = None
     multimodal_input_map = None
+    output_details_by_index = {d["index"]: d for d in output_details}
     if runtime_mode == "tflite":
         if interpreter is None or not input_details or not output_details:
             raise RuntimeError("runtime_bundle missing TFLite interpreter details")
@@ -805,6 +833,7 @@ def start_subscriber(runtime_bundle, manager, metrics, fault_localizer=None):
                 interpreter,
                 multimodal_input_map,
                 output_map,
+                output_details_by_index,
                 base_sample,
             )
             rul_mean = float(inference["rul_mean"])
@@ -815,13 +844,13 @@ def start_subscriber(runtime_bundle, manager, metrics, fault_localizer=None):
             interpreter.set_tensor(input_details[0]["index"], base_sample)
             interpreter.invoke()
 
-            rul_mean = float(
-                interpreter.get_tensor(output_map["rul_index"]).reshape(-1)[0]
-            )
-            rul_std = float(abs(
-                interpreter.get_tensor(output_map["rul_std_index"]).reshape(-1)[0]
-            ))
-            stage_probs = interpreter.get_tensor(output_map["stage_index"]).reshape(-1).tolist()
+            rul_detail = output_details_by_index[output_map["rul_index"]]
+            rul_std_detail = output_details_by_index[output_map["rul_std_index"]]
+            stage_detail = output_details_by_index[output_map["stage_index"]]
+
+            rul_mean = float(_read_tflite_output_tensor(interpreter, rul_detail).reshape(-1)[0])
+            rul_std = float(abs(_read_tflite_output_tensor(interpreter, rul_std_detail).reshape(-1)[0]))
+            stage_probs = _read_tflite_output_tensor(interpreter, stage_detail).reshape(-1).tolist()
         else:
             rul_predictions = []
             stage_predictions = []
@@ -831,12 +860,14 @@ def start_subscriber(runtime_bundle, manager, metrics, fault_localizer=None):
                 interpreter.set_tensor(input_details[0]["index"], base_sample + noise)
                 interpreter.invoke()
 
+                rul_detail = output_details_by_index[output_map["rul_index"]]
                 rul_predictions.append(
-                    float(interpreter.get_tensor(output_map["rul_index"]).reshape(-1)[0])
+                    float(_read_tflite_output_tensor(interpreter, rul_detail).reshape(-1)[0])
                 )
                 if output_map["stage_index"] is not None:
+                    stage_detail = output_details_by_index[output_map["stage_index"]]
                     stage_predictions.append(
-                        interpreter.get_tensor(output_map["stage_index"]).reshape(-1)
+                        _read_tflite_output_tensor(interpreter, stage_detail).reshape(-1)
                     )
 
             rul_mean = float(np.mean(rul_predictions))
