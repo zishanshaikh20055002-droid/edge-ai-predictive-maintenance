@@ -15,7 +15,7 @@ from tensorflow.keras import Model, layers
 from src.imbalance import build_weighted_binary_focal_loss, build_weighted_focal_bce
 
 
-def _temporal_encoder(inputs, filters=64, lstm_units=64, dropout=0.2, name_prefix="enc"):
+def _temporal_encoder(inputs, filters=64, lstm_units=64, dropout=0.2, mc_dropout=False, name_prefix="enc"):
     x = layers.Conv1D(filters, kernel_size=5, padding="same", activation="relu", name=f"{name_prefix}_conv1")(inputs)
     x = layers.BatchNormalization(name=f"{name_prefix}_bn1")(x)
     x = layers.Conv1D(filters, kernel_size=3, padding="same", activation="relu", name=f"{name_prefix}_conv2")(x)
@@ -25,7 +25,11 @@ def _temporal_encoder(inputs, filters=64, lstm_units=64, dropout=0.2, name_prefi
         name=f"{name_prefix}_bilstm",
     )(x)
     x = layers.GlobalAveragePooling1D(name=f"{name_prefix}_gap")(x)
-    x = layers.Dropout(dropout, name=f"{name_prefix}_dropout")(x)
+    dropout_layer = layers.Dropout(dropout, name=f"{name_prefix}_dropout")
+    if mc_dropout:
+        # MC Dropout: apply dropout even at inference time for uncertainty
+        dropout_layer = layers.Dropout(dropout, name=f"{name_prefix}_mc_dropout")
+    x = dropout_layer(x, training=True) if mc_dropout else dropout_layer(x)
     return x
 
 
@@ -38,6 +42,7 @@ def build_multimodal_mtl_model(
     electrical_features=4,
     thermal_embedding_dim=128,
     num_fault_classes=6,
+    mc_dropout=False,
 ):
     process_input = layers.Input(shape=(process_window, process_features), name="process_input")
     vibration_input = layers.Input(shape=(vibration_window, 3), name="vibration_input")
@@ -45,10 +50,10 @@ def build_multimodal_mtl_model(
     electrical_input = layers.Input(shape=(electrical_window, electrical_features), name="electrical_input")
     thermal_input = layers.Input(shape=(thermal_embedding_dim,), name="thermal_input")
 
-    process_vec = _temporal_encoder(process_input, filters=64, lstm_units=64, name_prefix="process")
-    vibration_vec = _temporal_encoder(vibration_input, filters=64, lstm_units=64, name_prefix="vibration")
-    acoustic_vec = _temporal_encoder(acoustic_input, filters=32, lstm_units=32, name_prefix="acoustic")
-    electrical_vec = _temporal_encoder(electrical_input, filters=32, lstm_units=32, name_prefix="electrical")
+    process_vec = _temporal_encoder(process_input, filters=64, lstm_units=64, mc_dropout=mc_dropout, name_prefix="process")
+    vibration_vec = _temporal_encoder(vibration_input, filters=64, lstm_units=64, mc_dropout=mc_dropout, name_prefix="vibration")
+    acoustic_vec = _temporal_encoder(acoustic_input, filters=32, lstm_units=32, mc_dropout=mc_dropout, name_prefix="acoustic")
+    electrical_vec = _temporal_encoder(electrical_input, filters=32, lstm_units=32, mc_dropout=mc_dropout, name_prefix="electrical")
 
     thermal_vec = layers.Dense(64, activation="relu", name="thermal_dense1")(thermal_input)
     thermal_vec = layers.Dropout(0.2, name="thermal_dropout")(thermal_vec)
