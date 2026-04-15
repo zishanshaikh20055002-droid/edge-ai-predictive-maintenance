@@ -1,5 +1,14 @@
 Edge AI Predictive Maintenance System
 
+Documentation Hub
+
+- Defense master guide: docs/PROJECT_DEFENSE_MASTER.md
+- Idea pitch scripts: docs/IDEA_PITCH_SCRIPTS.md
+- Teacher Q and A bank: docs/TEACHER_QA_BANK.md
+- Timeline and major changes: docs/PROJECT_TIMELINE_AND_CHANGES.md
+- Evaluation and accuracy guide: docs/EVALUATION_AND_ACCURACY.md
+- Training deep dive: TRAINING_GUIDE.md
+
 1. Introduction
 
 This project presents a real-time predictive maintenance system designed to monitor machine health, estimate Remaining Useful Life (RUL), and provide early warnings of potential failures.
@@ -61,428 +70,230 @@ Low-latency system behavior
 
 
 4.2 Predictive Analytics
+# PulseGuard Edge AI
+
+Predict failures early. Act with confidence.
 
-Machine learning model deployed using TensorFlow Lite
+PulseGuard Edge AI is a real-time predictive maintenance platform that ingests machine telemetry, estimates remaining useful life, localizes likely fault components, assigns alarm priority, and exposes the results through secure APIs, live dashboards, and observability tooling.
 
-Predicts Remaining Useful Life (RUL)
+It is built to work in two modes:
+- simulation mode for repeatable demos and evaluation
+- hardware mode for PLC/gateway-connected industrial data
 
-Classifies machine condition:
+## Why this project matters
 
-Healthy
+Industrial machines usually fail after degradation has already started. Traditional monitoring reacts late, often after a threshold is crossed. PulseGuard Edge AI moves the workflow earlier by combining machine learning, rule-based policy, and operator-facing diagnostics in one system.
+
+The result is not just a prediction model. It is a complete decision-support platform for maintenance planning.
 
-Warning
+## What we built
 
-Critical
+- real-time telemetry streaming with MQTT and WebSocket updates
+- RUL prediction and health stage classification
+- fault localization with component-level diagnosis
+- failure probability, time-to-failure, and maintenance priority outputs
+- alarm policy with explainable reasons and recommended action windows
+- secure FastAPI backend with JWT authentication, RBAC, and rate limiting
+- SQLite persistence for diagnostics and feedback loops
+- Prometheus metrics and Grafana dashboards for observability
+- multisource training pipeline with imbalance handling and domain adaptation hooks
+- PLC bridge design for Modbus, OPC UA, MQTT, and file-based polling
 
+## Core features
+
+### 1. Real-time monitoring
+
+The backend streams machine state in real time instead of requiring repeated polling. This makes the system suitable for live operations and low-latency dashboards.
+
+### 2. Predictive analytics
 
+The ML layer produces:
+- remaining useful life
+- healthy / warning / critical stage
+- failure probability
+- probable fault component
+- fault type and severity
+- confidence and maintenance window
 
-4.3 Dual Data Mode Support
+### 3. Rich diagnosis output
 
-Simulation Mode using dataset inputs
+The system now streams a full diagnostic record for each machine, including:
+- electrical telemetry: voltage, current, power
+- mechanical telemetry: speed, torque, vibration, tool wear
+- thermal telemetry: process and air temperatures
+- health index and time-to-failure
+- probable causes and recommended actions
+
+### 4. Fault localization model
+
+When a supervised fault-localizer artifact is available, the runtime uses ML-based component probabilities. If not, it falls back to rule-based localization so the system remains usable.
+
+### 5. Alarm policy
+
+Alarm level is not the same as health stage. Health stage describes condition, while alarm level reflects urgency. The policy uses failure probability, severity, confidence, and time-to-failure to assign:
+- INFO
+- ADVISORY
+- ALERT
+- EMERGENCY
+
+### 6. Fleet and feedback loops
 
-Hardware Mode for real-time sensor integration
+The platform supports fleet-level monitoring, human relabel feedback, and scheduled retraining with drift detection. That makes the project more realistic than a one-shot ML demo.
+
+## System architecture
 
+```text
+Sensors / Simulation / PLC Bridge
+        |
+        v
+MQTT Broker
+        |
+        v
+FastAPI Subscriber + Preprocessing
+        |
+        v
+ML Inference and Diagnostics
+        |
+        +--> SQLite persistence
+        +--> WebSocket live updates
+        +--> REST diagnosis APIs
+        +--> Alarm policy engine
+        |
+        v
+Dashboard + Prometheus + Grafana
+```
 
-4.4 Secure Authentication
+## Technology stack
 
-JWT-based authentication
+- Backend: Python, FastAPI, TensorFlow Lite, WebSockets
+- Frontend: HTML, CSS, JavaScript
+- Data storage: SQLite
+- Messaging: MQTT
+- Security: JWT, RBAC, rate limiting
+- Monitoring: Prometheus, Grafana
+- Deployment: Docker, Docker Compose
 
-Stateless session management
+## Machine learning pipeline
 
-Token-based authorization
+### Training data
 
+The system supports multisource training and fusion from:
+- AI4I 2020
+- CWRU bearing data
+- MIMII acoustic data
+- MetroPT-3 compressor telemetry
+- Edge-IIoTset network data
 
-4.5 Role-Based Access Control (RBAC)
+### Training capabilities
 
-Admin: Full system control
+- multisource dataset builder
+- class imbalance handling with effective-number weighting
+- focal-loss training for rare classes
+- weighted bootstrap resampling
+- multimodal fusion across process, vibration, acoustic, electrical, and thermal inputs
+- Monte Carlo Dropout support for uncertainty estimation
+- dataset verification CLI before training
+- evaluation metrics for RUL, faults, anomaly, and uncertainty
 
-Operator: Monitoring access only
+### Evaluation approach
 
+There is no single accuracy number for the whole project. We evaluate task-wise:
+- RUL: MAE, RMSE, MAPE, R²
+- faults: precision, recall, F1, ROC-AUC, hamming loss
+- anomaly: ROC-AUC, PR-AUC, thresholded F1
+- uncertainty: coverage, interval width, miscalibration
 
-4.6 Rate Limiting
+That is the correct way to evaluate a multi-task maintenance system.
 
-Prevents brute-force attacks
+## Project documentation
 
-Protects critical endpoints
+- Defense master guide: [docs/PROJECT_DEFENSE_MASTER.md](docs/PROJECT_DEFENSE_MASTER.md)
+- Idea pitch scripts: [docs/IDEA_PITCH_SCRIPTS.md](docs/IDEA_PITCH_SCRIPTS.md)
+- Teacher Q and A bank: [docs/TEACHER_QA_BANK.md](docs/TEACHER_QA_BANK.md)
+- Timeline and major changes: [docs/PROJECT_TIMELINE_AND_CHANGES.md](docs/PROJECT_TIMELINE_AND_CHANGES.md)
+- Evaluation and accuracy guide: [docs/EVALUATION_AND_ACCURACY.md](docs/EVALUATION_AND_ACCURACY.md)
+- Training guide: [TRAINING_GUIDE.md](TRAINING_GUIDE.md)
 
-Ensures system stability under load
+## Repository structure
 
+```text
+app.py                     FastAPI application and routes
+dashboard.html             Live web dashboard
+src/                       Runtime, ML, retraining, and integration code
+data/                      Training datasets and generated arrays
+models/                    Saved models and metadata
+grafana/                   Dashboard provisioning
+prometheus.yml             Metrics scraping config
+docker-compose.yml         Local stack orchestration
+```
 
-4.7 Control System
+## How to run locally
 
-Allows simulation of machine conditions:
+### 1. Install dependencies
 
-Normal
+```bash
+pip install -r requirements.txt
+```
 
-Degradation
+### 2. Start the stack
 
-Failure
+```bash
+docker compose up --build
+```
 
+### 3. Open the system
 
-Dynamically affects prediction outputs
+- API: `http://localhost:8000`
+- Dashboard: open `dashboard.html`
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000`
 
+## Useful commands
 
-4.8 Data Persistence
+### Verify datasets
 
-Stores predictions and sensor values
+```bash
+python -m src.verify_dataset --npz data/multisource_train.npz --verbose
+```
 
-Enables historical analysis
+### Train the multimodal model
 
+```bash
+python -m src.train_multimodal_mtl --rebuild-dataset --epochs 40 --batch-size 128
+```
 
-4.9 Observability and Monitoring
+### Evaluate metrics
 
-Metrics collection using Prometheus
+```python
+from src.evaluation_metrics import compute_all_metrics
+```
 
-Visualization using Grafana
+### Load the PLC bridge
 
-Tracks system performance and health
+```python
+from src.plc_bridge import PLCConfig, create_plc_connection, PLCStreamingBuffer
+```
 
+## What changed in recent work
 
-4.10 Containerization
+- hardened TFLite runtime scaling and replay defaults
+- improved dashboard diagnostics and score visualizations
+- added multisource dataset fusion and imbalance utilities
+- added evaluation metrics and dataset verification tooling
+- added domain adaptation and PLC bridge modules
+- created defense-ready documentation for teachers and viva prep
 
-Docker-based deployment
+## Honest limitations
 
-Environment consistency across systems
+This is a strong end-to-end platform, but the last step toward real deployment still requires plant-specific validation:
+- map the PLC registers or OPC UA nodes to the actual machine signals
+- calibrate thresholds on real site data
+- verify cross-domain adaptation on the target environment
+- confirm latency, reliability, and alarm policy against plant requirements
 
-Simplified setup and scaling
+## Closing summary
 
-
-4.11 Complete Machine Diagnosis (Real-Time)
-
-In addition to RUL and health stage, the system now streams full diagnosis fields per machine:
-
-Electrical telemetry: voltage, current, power
-
-Mechanical telemetry: speed, torque, vibration, tool wear
-
-Thermal telemetry: process and air temperatures
-
-Machine KPIs: health index, failure probability, time-to-failure (hours)
-
-Fault localization: likely component (stator/rotor/bearing/cooling/power_supply/lubrication),
-fault type, severity, confidence, probable causes, and recommended actions
-
-New diagnosis APIs:
-
-GET /diagnosis/latest/{machine_id}
-
-GET /diagnosis/recent/{machine_id}?limit=100
-
-
-4.12 Supervised Fault Localization (Phase 2)
-
-The system now supports a trainable component-localization model that can replace
-rule-only fault part ranking when a trained artifact is available.
-
-Runtime behavior:
-
-If models/fault_localizer.pkl exists, live diagnosis uses ML component probabilities.
-
-If missing or invalid, the system automatically falls back to rule-based localization.
-
-Model endpoints:
-
-GET /diagnosis/model/fault-localizer
-
-POST /diagnosis/model/fault-localizer/reload (admin)
-
-Training workflow:
-
-1) Create labeled dataset CSV from your plant logs using data/fault_localization_template.csv schema.
-
-2) Optionally bootstrap from historical diagnosis DB:
-
-python -m src.export_fault_training_data --min-confidence 0.6
-
-3) Train model:
-
-python -m src.train_fault_localization --input data/fault_localization_labeled.csv
-
-4) Reload model in running API:
-
-POST /diagnosis/model/fault-localizer/reload
-
-
-4.13 Alarm Policy and Maintenance Priority
-
-Alarm levels are generated in real time from failure probability, fault severity,
-confidence, and time-to-failure windows.
-
-Outputs now include:
-
-alarm_level (INFO, ADVISORY, ALERT, EMERGENCY)
-
-maintenance_priority (P4 to P1)
-
-alarm_reasons (list)
-
-recommended_window_hours
-
-Tuning env vars:
-
-ALARM_FAILURE_WARN
-
-ALARM_FAILURE_CRIT
-
-ALARM_TTF_WARN_HOURS
-
-ALARM_TTF_CRIT_HOURS
-
-
-4.14 Industrial Hardening (Fleet + Feedback + Auto-Retraining)
-
-The platform now includes three production hardening loops:
-
-1) Multi-machine fleet operations:
-
-GET /fleet/overview
-
-GET /fleet/machines
-
-The dashboard can monitor and rank all active machines by alert pressure,
-while still allowing deep drill-down on a selected machine.
-
-2) Human feedback relabel loop:
-
-POST /feedback/relabel
-
-GET /feedback/relabels?resolved=false&limit=20
-
-POST /feedback/relabels/{feedback_id}/resolve (admin)
-
-Operators can submit corrected fault-part labels for any diagnosis record.
-Resolved feedback is retained for supervised retraining and traceability.
-
-3) Scheduled auto-retraining with drift detection:
-
-GET /retraining/status
-
-POST /retraining/run-now (admin)
-
-The scheduler periodically evaluates feature drift against the baseline profile
-stored in models/fault_localizer_meta.json (feature statistics exported at training time).
-Retraining can be triggered by drift and/or enough resolved relabel samples,
-with cooldown and minimum-data gates.
-
-Scheduler and drift tuning environment variables:
-
-RETRAIN_ENABLED
-
-RETRAIN_CHECK_MINUTES
-
-RETRAIN_MIN_COOLDOWN_MINUTES
-
-RETRAIN_MIN_ROWS
-
-RETRAIN_MIN_FEEDBACK
-
-RETRAIN_MIN_CONFIDENCE
-
-RETRAIN_REQUIRE_DRIFT
-
-DRIFT_ZSCORE_THRESHOLD
-
-DRIFT_WINDOW_ROWS
-
-
-Training export note:
-
-python -m src.export_fault_training_data now merges resolved human feedback labels
-into the supervised target (fault_component) before retraining.
-
-
-
----
-
-5. System Architecture
-
-Data Source (Simulation / Sensors)
-        │
-        ▼
-Preprocessing Layer (Scaling / Formatting)
-        │
-        ▼
-Machine Learning Model (TFLite)
-        │
-        ▼
-FastAPI Backend
-   ├── REST APIs
-   ├── WebSocket Streaming
-   ├── Authentication (JWT)
-   ├── Rate Limiting
-   └── Control Logic
-        │
-        ▼
-Database (SQLite)
-        │
-        ▼
-Frontend Dashboard (Real-Time UI)
-        │
-        ▼
-Prometheus (Metrics Collection)
-        │
-        ▼
-Grafana (Visualization)
-
-
----
-
-6. Technology Stack
-
-Backend
-
-Python
-
-FastAPI (asynchronous API framework)
-
-TensorFlow Lite (optimized ML inference)
-
-WebSockets (real-time communication)
-
-
-Frontend
-
-HTML, CSS, JavaScript
-
-Real-time dashboard updates
-
-
-Database
-
-SQLite (lightweight relational database)
-
-
-Security
-
-JWT Authentication
-
-Role-Based Access Control
-
-
-Monitoring
-
-Prometheus (metrics collection)
-
-Grafana (metrics visualization)
-
-
-DevOps
-
-Docker (containerization)
-
-Git (version control)
-
-
-
----
-
-7. Machine Learning Component
-
-7.1 Model Overview
-
-The system uses a machine learning model to predict Remaining Useful Life (RUL) based on sensor data.
-
-7.2 Deployment
-
-Converted to TensorFlow Lite format
-
-Optimized for low-latency inference
-
-
-7.3 Output Interpretation
-
-RUL > threshold → Healthy
-
-Moderate RUL → Warning
-
-Low RUL → Critical
-
-
-7.4 Current Status
-
-Trained on processed/simulated dataset
-
-Designed to integrate real industrial datasets
-
-
-
----
-
-8. Backend Design
-
-8.1 FastAPI
-
-Used as the core backend framework due to:
-
-High performance
-
-Asynchronous request handling
-
-Native WebSocket support
-
-
-8.2 API Design
-
-REST endpoints for control and authentication
-
-WebSocket endpoint for real-time streaming
-
-
-8.3 Authentication Flow
-
-User login → token generation
-
-Token used for protected endpoints
-
-Role-based authorization enforced
-
-
-
----
-
-9. Real-Time Communication
-
-WebSockets are used for:
-
-Continuous streaming of predictions
-
-Eliminating polling overhead
-
-Achieving near real-time updates
-
-
-
----
-
-10. Monitoring and Observability
-
-10.1 Prometheus
-
-Collects system metrics
-
-Tracks:
-
-request count
-
-response time
-
-error rates
-
-system usage
-
-
-
-10.2 Grafana
-
-Visualizes metrics in dashboards
-
-Enables performance analysis
-
-Detects anomalies in system behavior
-
-
-
----
+PulseGuard Edge AI is a full predictive maintenance platform, not just a model. It combines streaming ingestion, intelligent diagnosis, operator-friendly dashboards, secure APIs, observability, and a path to real hardware integration. That is the strongest way to present the project on GitHub and in front of teachers.
 
 11. Data Handling
 
