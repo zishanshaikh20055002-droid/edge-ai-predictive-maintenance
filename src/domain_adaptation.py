@@ -31,16 +31,13 @@ class GradientReversalLayer(layers.Layer):
         super().__init__(**kwargs)
         self.lambd = float(lambd)
     
-    def call(self, x: tf.Tensor) -> tf.Tensor:
-        return x
-    
     @tf.custom_gradient
     def _grad_reverse(self, x: tf.Tensor) -> tuple[tf.Tensor, callable]:
         def grad(dy):
             return -self.lambd * dy
         return x, grad
     
-    def call(self, x):
+    def call(self, x: tf.Tensor) -> tf.Tensor:
         return self._grad_reverse(x)
 
 
@@ -149,25 +146,18 @@ def build_domain_mixup_layer(alpha: float = 1.0):
     ) -> tuple[tf.Tensor, tf.Tensor]:
         batch_size = tf.shape(inputs_batch1)[0]
         
-        # Sample mix coefficient from Beta distribution
-        lam = tf.random.uniform(
-            shape=(batch_size, 1),
-            minval=0.0,
-            maxval=1.0,
-            dtype=tf.float32,
-        )
-        
         if alpha > 0:
-            # Use Beta distribution for more control over blend distribution
-            lam = tf.cast(
-                tf.random.gamma(
-                    shape=[batch_size, 1],
-                    alpha=alpha,
-                    dtype=tf.float32,
-                ) / (alpha + 1e-8),
-                tf.float32,
+            # Beta(alpha, alpha) via two gamma samples.
+            g1 = tf.random.gamma(shape=[batch_size, 1], alpha=alpha, dtype=tf.float32)
+            g2 = tf.random.gamma(shape=[batch_size, 1], alpha=alpha, dtype=tf.float32)
+            lam = g1 / (g1 + g2 + 1e-8)
+        else:
+            lam = tf.random.uniform(
+                shape=(batch_size, 1),
+                minval=0.0,
+                maxval=1.0,
+                dtype=tf.float32,
             )
-            lam = tf.minimum(lam, 1.0)
         
         # Mix inputs and targets
         mixed_inputs = lam * inputs_batch1 + (1.0 - lam) * inputs_batch2
@@ -203,17 +193,20 @@ def progressive_unfreezing(
     # Number of layers to unfreeze based on progress
     num_to_unfreeze = max(1, int(len(frozen_layers) * progress))
     
+    def _set_trainable(layer_name: str, trainable: bool) -> None:
+        try:
+            layer = model.get_layer(layer_name)
+        except Exception:
+            return
+        layer.trainable = trainable
+
     # Unfreeze the last `num_to_unfreeze` layers
     for layer_name in frozen_layers[-num_to_unfreeze:]:
-        layer = model.get_layer(layer_name)
-        if layer is not None:
-            layer.trainable = True
+        _set_trainable(layer_name, True)
     
     # Keep earlier layers frozen
     for layer_name in frozen_layers[:-num_to_unfreeze]:
-        layer = model.get_layer(layer_name)
-        if layer is not None:
-            layer.trainable = False
+        _set_trainable(layer_name, False)
 
 
 def build_domain_adapted_mtl_model(
@@ -359,9 +352,9 @@ def focal_domain_confusion_loss(
         Scalar focal domain loss
     """
     if alpha_domains is None:
-        alpha_domains = np.ones(domain_predictions.shape[-1], dtype=np.float32)
-    
-    alpha = tf.constant(alpha_domains, dtype=tf.float32)
+        alpha = tf.ones(shape=(tf.shape(domain_predictions)[-1],), dtype=tf.float32)
+    else:
+        alpha = tf.convert_to_tensor(alpha_domains, dtype=tf.float32)
     
     # Cross-entropy
     ce = -tf.reduce_sum(true_domains * tf.math.log(domain_predictions + 1e-8), axis=-1)

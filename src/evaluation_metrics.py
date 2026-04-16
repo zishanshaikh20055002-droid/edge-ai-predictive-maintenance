@@ -18,7 +18,6 @@ from sklearn.metrics import (
     f1_score,
     precision_score,
     recall_score,
-    roc_curve,
     hamming_loss,
     accuracy_score,
 )
@@ -144,6 +143,7 @@ def fault_metrics(
 def anomaly_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    threshold: float | None = None,
     compute_pr_curve: bool = False,
 ) -> dict[str, float | dict[str, np.ndarray]]:
     """
@@ -172,10 +172,9 @@ def anomaly_metrics(
         except Exception:
             roc_auc = np.nan
     
-    # PR-AUC with F1@optimal threshold
+    # PR-AUC with F1@optimal threshold (unless threshold override is provided)
     pr_auc = np.nan
-    f1_at_threshold = np.nan
-    best_threshold = 0.5
+    best_threshold = 0.5 if threshold is None else float(np.clip(threshold, 0.0, 1.0))
     
     if len(np.unique(y_true)) > 1:
         try:
@@ -185,8 +184,8 @@ def anomaly_metrics(
             # Find F1-optimal threshold
             f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
             best_idx = np.nanargmax(f1_scores)
-            best_threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
-            f1_at_threshold = float(f1_scores[best_idx])
+            if threshold is None:
+                best_threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
         except Exception:
             pass
     
@@ -231,8 +230,22 @@ def uncertainty_metrics(
     y_pred = np.asarray(y_pred, dtype=np.float32).flatten()
     uncertainty = np.asarray(uncertainty, dtype=np.float32).flatten()
     
-    # Z-score for percentile (approximate, assumes Normal)
-    z_score = np.sqrt(2) * np.abs(np.arctanh(2 * percentile - 1))
+    percentile = float(np.clip(percentile, 1e-6, 1.0 - 1e-6))
+
+    # Two-sided normal interval, e.g. percentile=0.95 -> z=1.96
+    try:
+        from scipy.stats import norm
+
+        z_score = float(norm.ppf(0.5 + percentile / 2.0))
+    except Exception:
+        fallback = {
+            0.8: 1.2815515655,
+            0.9: 1.6448536269,
+            0.95: 1.9599639845,
+            0.99: 2.5758293035,
+        }
+        nearest = min(fallback.keys(), key=lambda k: abs(k - percentile))
+        z_score = fallback[nearest]
     
     lower = y_pred - z_score * uncertainty
     upper = y_pred + z_score * uncertainty
@@ -280,7 +293,7 @@ def compute_all_metrics(
     metrics = {
         "rul": rul_metrics(y_rul_true, y_rul_pred),
         "faults": fault_metrics(y_faults_true, y_faults_pred, threshold=fault_threshold),
-        "anomaly": anomaly_metrics(y_anomaly_true, y_anomaly_pred),
+        "anomaly": anomaly_metrics(y_anomaly_true, y_anomaly_pred, threshold=anomaly_threshold),
     }
     
     if y_rul_uncertainty is not None:
